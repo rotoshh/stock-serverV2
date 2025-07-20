@@ -4,7 +4,6 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const OpenAI = require('openai');
-const { SendEmail } = require('./integrations/Core'); // החלף לפי המיקום האמיתי שלך
 const log = console; // או החלף בלוגר שלך
 
 const app = express();
