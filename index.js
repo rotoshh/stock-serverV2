@@ -1,10 +1,10 @@
 require('dotenv').config();
-console.log('🔑 OPENAI API KEY:', process.env.OPENAI_API_KEY?.slice(0, 10) || 'MISSING');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const OpenAI = require('openai');
-const log = console; // או החלף בלוגר שלך
+const { sendEmail } = require('./utils/emailService'); // ✅ נוספה השורה הזו
+const log = console;
 
 const app = express();
 app.use(cors());
@@ -14,11 +14,11 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// --- מאגרי נתונים בזיכרון (דמה) ---
+// --- מאגרי נתונים בזיכרון ---
 const userPortfolios = {};
-const userPrices = {}; // מחירי מניות אחרונים לפי משתמש
+const userPrices = {};
 
-// --- פרומפט חישוב סיכון מתקדם ---
+// --- תבנית לפרומפט ---
 const PROMPT_TEMPLATE = `בצע ניתוח סיכון מתקדם וכמותי ברמה מוסדית עבור המניה {TICKER} כדי לקבוע ציון סיכון מדויק.
 
 *פרטי השקעה:*
@@ -56,26 +56,6 @@ async function calculateAdvancedRisk(stockData) {
   }
 }
 
-async function sendStopLossEmail(userEmail, stockTicker, newStopLoss) {
-  try {
-    await SendEmail({
-      to: userEmail,
-      from_name: "RiskWise Auto-Trader",
-      subject: `📢 התראת Stop-Loss אוטומטית עבור ${stockTicker}`,
-      body: `
-        <h1>עדכון סטופ-לוס אוטומטי</h1>
-        <p>שלום,</p>
-        <p>מערכת הניטור האוטומטית זיהתה שינוי משמעותי במניית <strong>${stockTicker}</strong>.</p>
-        <p>בהתאם, חושב ונקבע מחיר Stop-Loss חדש: <strong>$${newStopLoss.toFixed(2)}</strong>.</p>
-        <p>צוות RiskWise</p>
-      `
-    });
-    log.info(`Email alert sent to ${userEmail} for ${stockTicker}`);
-  } catch (error) {
-    log.error(`Failed to send email alert for ${stockTicker} to ${userEmail}: ${error.message}`);
-  }
-}
-
 async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData, currentPrice) {
   const oldStopLoss = portfolio.stocks[stockSymbol].stopLoss || 0;
   const riskLevelPercent = portfolio.portfolioRiskLevel || 10;
@@ -84,7 +64,17 @@ async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData,
   if (Math.abs(newStopLoss - oldStopLoss) > 0.01) {
     portfolio.stocks[stockSymbol].stopLoss = newStopLoss;
 
-    await sendStopLossEmail(portfolio.userEmail, stockSymbol, newStopLoss);
+    // ✅ שליחת מייל דרך Gmail
+    await sendEmail({
+      to: portfolio.userEmail,
+      subject: `📉 התראת Stop Loss עבור ${stockSymbol}`,
+      html: `
+        <h1>התראה ממערכת RiskWise</h1>
+        <p>הסטופ לוס של <strong>${stockSymbol}</strong> עודכן ל: <strong>$${newStopLoss.toFixed(2)}</strong></p>
+        <p>בהצלחה במסחר,</p>
+        <p>צוות RiskWise</p>
+      `
+    });
 
     if (!portfolio.userNotifications) portfolio.userNotifications = [];
     portfolio.userNotifications.push({
