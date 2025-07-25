@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const OpenAI = require('openai');
-const { sendEmail } = require('./utils/emailService'); // ✅ נוספה השורה הזו
+const { SendEmail } = require('./emailService');
 const log = console;
 
 const app = express();
