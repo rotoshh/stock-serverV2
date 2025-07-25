@@ -6,7 +6,7 @@ const logFile = path.join(__dirname, 'server.log');
 
 function writeLog(level, message) {
   const timestamp = new Date().toISOString();
-  const line = [${timestamp}] [${level.toUpperCase()}] ${message}\n;
+  const line = `[${timestamp}] [${level.toUpperCase()}] ${message}\n`; // ← תוקן כאן
   fs.appendFile(logFile, line, (err) => {
     if (err) console.error("❌ שגיאה בכתיבה ללוג:", err.message);
   });
@@ -23,6 +23,6 @@ module.exports = {
   },
   warn: (msg) => {
     console.warn(msg);
-    writeLog('warn', msg);
-}
+    writeLog('warn', msg);
+  }
 };
