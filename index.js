@@ -3,7 +3,9 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const OpenAI = require('openai');
-const { SendEmail } = require('./emailService');
+const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
+const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
+const { sendEmail } = require('./emailService'); 
 const log = console;
 
 const app = express();
@@ -64,7 +66,6 @@ async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData,
   if (Math.abs(newStopLoss - oldStopLoss) > 0.01) {
     portfolio.stocks[stockSymbol].stopLoss = newStopLoss;
 
-    // ✅ שליחת מייל דרך Gmail
     await sendEmail({
       to: portfolio.userEmail,
       subject: `📉 התראת Stop Loss עבור ${stockSymbol}`,
@@ -121,7 +122,13 @@ async function checkAndUpdatePrices() {
 
     for (const symbol in portfolio.stocks) {
       try {
-        const price = +(100 + Math.random() * 50).toFixed(2);
+        let price;
+
+        if (portfolio.alpacaKeys?.key && portfolio.alpacaKeys?.secret) {
+          price = await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret);
+        } else {
+          price = await getFinnhubPrice(symbol);
+        }
 
         const prevPrice = userPrices[userId][symbol]?.price || null;
         userPrices[userId][symbol] = { price, time: Date.now() };
@@ -129,8 +136,9 @@ async function checkAndUpdatePrices() {
         log.info(`${userId} - ${symbol}: $${price} (סטופ לוס: ${portfolio.stocks[symbol].stopLoss})`);
 
         let shouldRecalculateRisk = false;
-        if (prevPrice === null) shouldRecalculateRisk = true;
-        else {
+        if (prevPrice === null || prevPrice === 0) {
+          shouldRecalculateRisk = true;
+        } else {
           const changePercent = Math.abs(price - prevPrice) / prevPrice * 100;
           if (changePercent >= 5) shouldRecalculateRisk = true;
         }
@@ -163,13 +171,14 @@ async function checkAndUpdatePrices() {
 }
 
 async function sellStock(userId, symbol, quantity, price) {
-  const portfolio = userPortfolios[userId];
+  const portfolio = userPortfolios[userId]; // 🛠️ חובה
+
   if (!portfolio || !portfolio.alpacaKeys) {
     log.warn(`אין מפתחות Alpaca למשתמש ${userId} - לא מבצעים מכירה אמיתית`);
     portfolio.userNotifications.push({
       id: Date.now() + Math.random(),
       type: 'simulated_sell',
-      message: `בוצעה סימולציית מכירה למניה ${symbol} בכמות ${quantity} במחיר $${price}`,
+      message: `📢 הגיע הזמן למכור את ${symbol} לפי סימולציית סטופ לוס`,
       timestamp: new Date().toISOString(),
       stockTicker: symbol,
       read: false
