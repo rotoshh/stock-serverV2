@@ -16,11 +16,10 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// --- מאגרי נתונים בזיכרון ---
 const userPortfolios = {};
 const userPrices = {};
+const priceHistory15Min = {};
 
-// --- תבנית לפרומפט ---
 const PROMPT_TEMPLATE = `בצע ניתוח סיכון מתקדם וכמותי ברמה מוסדית עבור המניה {TICKER} כדי לקבוע ציון סיכון מדויק.
 
 *פרטי השקעה:*
@@ -99,7 +98,7 @@ app.post('/update-portfolio', (req, res) => {
   const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
 
   if (!userId || !stocks || !userEmail || !portfolioRiskLevel || !totalInvestment) {
-    return res.status(400).json({ error: 'חסרים נתונים נדרשים (userId, stocks, userEmail, portfolioRiskLevel, totalInvestment)' });
+    return res.status(400).json({ error: 'חסרים נתונים נדרשים' });
   }
 
   userPortfolios[userId] = {
@@ -115,6 +114,38 @@ app.post('/update-portfolio', (req, res) => {
   res.json({ message: 'התיק נשמר בהצלחה' });
 });
 
+async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
+  if (!priceHistory15Min[userId]) priceHistory15Min[userId] = {};
+  const now = Date.now();
+
+  const history = priceHistory15Min[userId][symbol];
+  if (history && now - history.time <= 15 * 60 * 1000) {
+    const change = ((currentPrice - history.price) / history.price) * 100;
+    if (change <= -5) {
+      log.info(`📉 ירידה של ${change.toFixed(2)}% ב-15 דקות במניה ${symbol} למשתמש ${userId}`);
+
+      const stockData = {
+        ticker: symbol,
+        currentPrice,
+        quantity: portfolio.stocks[symbol].quantity || 1,
+        amountInvested: portfolio.stocks[symbol].amountInvested || currentPrice * (portfolio.stocks[symbol].quantity || 1),
+        sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
+      };
+
+      const riskResult = await calculateAdvancedRisk(stockData);
+      if (riskResult) {
+        const { shouldSell, newStopLoss } = await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, currentPrice);
+        if (shouldSell) {
+          await sellStock(userId, symbol, portfolio.stocks[symbol].quantity, currentPrice);
+          log.info(`📉 מכירה לאחר ירידה של 5% ב-15 דקות: ${symbol} במחיר $${currentPrice}`);
+        }
+      }
+    }
+  }
+
+  priceHistory15Min[userId][symbol] = { price: currentPrice, time: now };
+}
+
 async function checkAndUpdatePrices() {
   for (const userId in userPortfolios) {
     const portfolio = userPortfolios[userId];
@@ -123,7 +154,6 @@ async function checkAndUpdatePrices() {
     for (const symbol in portfolio.stocks) {
       try {
         let price;
-
         if (portfolio.alpacaKeys?.key && portfolio.alpacaKeys?.secret) {
           price = await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret);
         } else {
@@ -134,6 +164,8 @@ async function checkAndUpdatePrices() {
         userPrices[userId][symbol] = { price, time: Date.now() };
 
         log.info(`${userId} - ${symbol}: $${price} (סטופ לוס: ${portfolio.stocks[symbol].stopLoss})`);
+
+        await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
 
         let shouldRecalculateRisk = false;
         if (prevPrice === null || prevPrice === 0) {
@@ -156,7 +188,6 @@ async function checkAndUpdatePrices() {
 
           if (riskResult) {
             const { shouldSell, newStopLoss } = await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, price);
-
             if (shouldSell) {
               await sellStock(userId, symbol, portfolio.stocks[symbol].quantity, price);
               log.info(`מכירת מניה ${symbol} למשתמש ${userId} במחיר $${price} בעקבות סטופ לוס`);
@@ -171,10 +202,9 @@ async function checkAndUpdatePrices() {
 }
 
 async function sellStock(userId, symbol, quantity, price) {
-  const portfolio = userPortfolios[userId]; // 🛠️ חובה
-
+  const portfolio = userPortfolios[userId];
   if (!portfolio || !portfolio.alpacaKeys) {
-    log.warn(`אין מפתחות Alpaca למשתמש ${userId} - לא מבצעים מכירה אמיתית`);
+    log.warn(`אין Alpaca למשתמש ${userId} - סימולציית מכירה בלבד`);
     portfolio.userNotifications.push({
       id: Date.now() + Math.random(),
       type: 'simulated_sell',
@@ -231,6 +261,6 @@ app.get('/portfolio/:userId', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log.info(`Server started on port ${PORT}`);
-  setInterval(checkAndUpdatePrices, 5 * 60 * 1000);
+  log.info(`✅ Server started on port ${PORT}`);
+  setInterval(checkAndUpdatePrices, 5 * 60 * 1000); // כל 5 דקות
 });
