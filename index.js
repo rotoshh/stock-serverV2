@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const OpenAI = require('openai');
+const cron = require('node-cron');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
 const { sendEmail } = require('./emailService'); 
@@ -39,7 +40,7 @@ async function calculateAdvancedRisk(stockData) {
       .replace('{AMOUNT_INVESTED}', stockData.amountInvested)
       .replace('{SECTOR}', stockData.sector || 'לא מוגדר');
 
-    log.info(`Requesting risk analysis for ${stockData.ticker}`);
+    log.info(`🧠 Requesting risk analysis for ${stockData.ticker}`);
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4-turbo',
@@ -48,11 +49,11 @@ async function calculateAdvancedRisk(stockData) {
     });
 
     const result = JSON.parse(response.choices[0].message.content);
-    log.info(`Risk score for ${stockData.ticker}: ${result.risk_score}`);
+    log.info(`✅ Risk score for ${stockData.ticker}: ${result.risk_score}`);
 
     return result;
   } catch (error) {
-    log.error(`Error in risk calculation for ${stockData.ticker}: ${error.message}`);
+    log.error(`❌ Error in risk calculation for ${stockData.ticker}: ${error.message}`);
     return null;
   }
 }
@@ -71,8 +72,6 @@ async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData,
       html: `
         <h1>התראה ממערכת RiskWise</h1>
         <p>הסטופ לוס של <strong>${stockSymbol}</strong> עודכן ל: <strong>$${newStopLoss.toFixed(2)}</strong></p>
-        <p>בהצלחה במסחר,</p>
-        <p>צוות RiskWise</p>
       `
     });
 
@@ -110,7 +109,7 @@ app.post('/update-portfolio', (req, res) => {
     userNotifications: []
   };
 
-  log.info(`תיק עודכן עבור משתמש ${userId}`);
+  log.info(`📁 תיק עודכן עבור משתמש ${userId}`);
   res.json({ message: 'התיק נשמר בהצלחה' });
 });
 
@@ -144,6 +143,48 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
   }
 
   priceHistory15Min[userId][symbol] = { price: currentPrice, time: now };
+}
+
+async function checkEarningsReports() {
+  const today = new Date().toISOString().split('T')[0];
+
+  for (const userId in userPortfolios) {
+    const portfolio = userPortfolios[userId];
+
+    for (const symbol in portfolio.stocks) {
+      try {
+        const response = await axios.get('https://finnhub.io/api/v1/calendar/earnings', {
+          params: {
+            symbol,
+            from: today,
+            to: today,
+            token: process.env.FINNHUB_API_KEY
+          }
+        });
+
+        const earningsToday = response.data?.earningsCalendar?.some(r => r.symbol === symbol);
+        if (earningsToday) {
+          log.info(`📢 ${symbol} - דוח כספי היום. מחשבים סיכון מחדש...`);
+
+          const price = await getFinnhubPrice(symbol);
+          const stockData = {
+            ticker: symbol,
+            currentPrice: price,
+            quantity: portfolio.stocks[symbol].quantity || 1,
+            amountInvested: portfolio.stocks[symbol].amountInvested || price * (portfolio.stocks[symbol].quantity || 1),
+            sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
+          };
+
+          const riskResult = await calculateAdvancedRisk(stockData);
+          if (riskResult) {
+            await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, price);
+          }
+        }
+      } catch (err) {
+        log.error(`❌ שגיאה בבדיקת דוחות כספיים עבור ${symbol}: ${err.message}`);
+      }
+    }
+  }
 }
 
 async function checkAndUpdatePrices() {
@@ -185,17 +226,17 @@ async function checkAndUpdatePrices() {
           };
 
           const riskResult = await calculateAdvancedRisk(stockData);
-
           if (riskResult) {
             const { shouldSell, newStopLoss } = await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, price);
             if (shouldSell) {
               await sellStock(userId, symbol, portfolio.stocks[symbol].quantity, price);
-              log.info(`מכירת מניה ${symbol} למשתמש ${userId} במחיר $${price} בעקבות סטופ לוס`);
+              log.info(`💸 מכירה בעקבות סטופ לוס: ${symbol} במחיר $${price}`);
             }
           }
         }
+
       } catch (err) {
-        log.error(`שגיאה בעדכון מחיר עבור ${symbol} למשתמש ${userId}: ${err.message}`);
+        log.error(`❌ שגיאה בעדכון מחיר עבור ${symbol}: ${err.message}`);
       }
     }
   }
@@ -204,11 +245,11 @@ async function checkAndUpdatePrices() {
 async function sellStock(userId, symbol, quantity, price) {
   const portfolio = userPortfolios[userId];
   if (!portfolio || !portfolio.alpacaKeys) {
-    log.warn(`אין Alpaca למשתמש ${userId} - סימולציית מכירה בלבד`);
+    log.warn(`🚫 אין Alpaca למשתמש ${userId} - סימולציית מכירה בלבד`);
     portfolio.userNotifications.push({
       id: Date.now() + Math.random(),
       type: 'simulated_sell',
-      message: `📢 הגיע הזמן למכור את ${symbol} לפי סימולציית סטופ לוס`,
+      message: `📢 הגיע הזמן למכור את ${symbol} לפי סימולציה`,
       timestamp: new Date().toISOString(),
       stockTicker: symbol,
       read: false
@@ -234,18 +275,18 @@ async function sellStock(userId, symbol, quantity, price) {
       time_in_force: 'day'
     });
 
-    log.info(`מכירה בוצעה ב-Alpaca עבור ${symbol} - כמות: ${quantity}`);
+    log.info(`🚀 מכירה בוצעה ב-Alpaca עבור ${symbol} - כמות: ${quantity}`);
     portfolio.userNotifications.push({
       id: Date.now() + Math.random(),
       type: 'sell_order',
-      message: `בוצעה מכירה אוטומטית למניה ${symbol} בכמות ${quantity}`,
+      message: `💸 בוצעה מכירה אוטומטית למניה ${symbol} בכמות ${quantity}`,
       timestamp: new Date().toISOString(),
       stockTicker: symbol,
       read: false
     });
 
   } catch (error) {
-    log.error(`שגיאה במכירה ב-Alpaca עבור ${symbol}: ${error.message}`);
+    log.error(`❌ שגיאה במכירה ב-Alpaca עבור ${symbol}: ${error.message}`);
   }
 }
 
@@ -263,4 +304,16 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   log.info(`✅ Server started on port ${PORT}`);
   setInterval(checkAndUpdatePrices, 5 * 60 * 1000); // כל 5 דקות
+});
+
+// ✅ תזמון שבועי: כל יום שישי ב-14:00
+cron.schedule('0 14 * * 5', () => {
+  log.info('📆 ריצת חישוב שבועית (יום שישי)');
+  checkAndUpdatePrices();
+});
+
+// ✅ תזמון יומי לבדוק דוחות כספיים כל יום ב-10:00
+cron.schedule('0 10 * * *', () => {
+  log.info('📊 בדיקת דוחות כספיים יומית');
+  checkEarningsReports();
 });
