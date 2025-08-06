@@ -1,25 +1,15 @@
-const finnhub = require('finnhub');
+const axios = require('axios');
 
-const api_key = finnhub.ApiClient.instance.authentications['api_key'];
-api_key.apiKey = process.env.FINNHUB_API_KEY;
-
-const finnhubClient = new finnhub.DefaultApi();
-
-/**
- * מחזיר את המחיר הנוכחי של מניה לפי הסימול שלה
- * @param {string} symbol - סימול המניה (למשל "AAPL")
- * @returns {Promise<number>} המחיר הנוכחי
- */
-function getRealTimePrice(symbol) {
-  return new Promise((resolve, reject) => {
-    finnhubClient.quote(symbol, (error, data) => {
-      if (error) return reject(error);
-      if (!data || typeof data.c !== 'number') {
-        return reject(new Error(`Price not available for ${symbol}`));
-      }
-      resolve(data.c); // המחיר הנוכחי
-    });
-  });
+async function getRealTimePrice(symbol) {
+  const url = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${process.env.FINNHUB_API_KEY}`;
+  try {
+    const response = await axios.get(url);
+    return response.data.c; // מחיר נוכחי
+  } catch (error) {
+    console.error(`שגיאה בשליפת מחיר מ-Finnhub עבור ${symbol}:`, error.message);
+    throw error;
+  }
 }
 
 module.exports = { getRealTimePrice };
+
