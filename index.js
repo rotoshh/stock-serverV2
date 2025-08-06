@@ -43,7 +43,7 @@ async function calculateAdvancedRisk(stockData) {
     log.info(`🧠 Requesting risk analysis for ${stockData.ticker}`);
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4-turbo',
+      model: 'gpt-4o',
       messages: [{ role: 'user', content: prompt }],
       response_format: { type: 'json_object' }
     });
