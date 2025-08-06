@@ -7,7 +7,7 @@ const cron = require('node-cron');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
 const { sendEmail } = require('./emailService');
-const { sendPushNotification } = require('./pushServices');
+const { sendPushNotification } = require('./pushService');
 const log = console;
 
 const app = express();
