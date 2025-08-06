@@ -6,7 +6,8 @@ const OpenAI = require('openai');
 const cron = require('node-cron');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
-const { sendEmail } = require('./emailService'); 
+const { sendEmail } = require('./emailService');
+const { sendPushNotification } = require('./pushServices');
 const log = console;
 
 const app = express();
@@ -22,7 +23,6 @@ const userPrices = {};
 const priceHistory15Min = {};
 
 const PROMPT_TEMPLATE = `בצע ניתוח סיכון מתקדם וכמותי ברמה מוסדית עבור המניה {TICKER} כדי לקבוע ציון סיכון מדויק.
-
 *פרטי השקעה:*
 - מחיר נוכחי: {CURRENT_PRICE}
 - כמות: {QUANTITY}
@@ -50,12 +50,17 @@ async function calculateAdvancedRisk(stockData) {
 
     const result = JSON.parse(response.choices[0].message.content);
     log.info(`✅ Risk score for ${stockData.ticker}: ${result.risk_score}`);
-
     return result;
   } catch (error) {
     log.error(`❌ Error in risk calculation for ${stockData.ticker}: ${error.message}`);
     return null;
   }
+}
+
+async function sendAllNotifications(userId, portfolio, notification) {
+  if (!portfolio.userNotifications) portfolio.userNotifications = [];
+  portfolio.userNotifications.push(notification);
+  await sendPushNotification(userId, notification.message);
 }
 
 async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData, currentPrice) {
@@ -69,14 +74,10 @@ async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData,
     await sendEmail({
       to: portfolio.userEmail,
       subject: `📉 התראת Stop Loss עבור ${stockSymbol}`,
-      html: `
-        <h1>התראה ממערכת RiskWise</h1>
-        <p>הסטופ לוס של <strong>${stockSymbol}</strong> עודכן ל: <strong>$${newStopLoss.toFixed(2)}</strong></p>
-      `
+      html: `<h1>התראה ממערכת RiskWise</h1><p>הסטופ לוס של <strong>${stockSymbol}</strong> עודכן ל: <strong>$${newStopLoss.toFixed(2)}</strong></p>`
     });
 
-    if (!portfolio.userNotifications) portfolio.userNotifications = [];
-    portfolio.userNotifications.push({
+    const notification = {
       id: Date.now() + Math.random(),
       type: 'stop_loss_update',
       message: `סטופ לוס חדש למניה ${stockSymbol}: $${newStopLoss.toFixed(2)}`,
@@ -84,7 +85,8 @@ async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData,
       stockTicker: stockSymbol,
       newStopLoss,
       read: false
-    });
+    };
+    await sendAllNotifications(userId, portfolio, notification);
 
     if (currentPrice <= newStopLoss) {
       return { shouldSell: true, newStopLoss };
@@ -95,7 +97,6 @@ async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData,
 
 app.post('/update-portfolio', (req, res) => {
   const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
-
   if (!userId || !stocks || !userEmail || !portfolioRiskLevel || !totalInvestment) {
     return res.status(400).json({ error: 'חסרים נתונים נדרשים' });
   }
@@ -134,9 +135,11 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
       const riskResult = await calculateAdvancedRisk(stockData);
       if (riskResult) {
         const { shouldSell, newStopLoss } = await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, currentPrice);
+        const message = `⚠️ ירידה של 5% ב-15 דקות במניה ${symbol} - ${shouldSell ? 'בוצעה מכירה!' : 'סטופ לוס עודכן'}`;
+        await sendPushNotification(userId, message);
+
         if (shouldSell) {
           await sellStock(userId, symbol, portfolio.stocks[symbol].quantity, currentPrice);
-          log.info(`📉 מכירה לאחר ירידה של 5% ב-15 דקות: ${symbol} במחיר $${currentPrice}`);
         }
       }
     }
@@ -150,22 +153,15 @@ async function checkEarningsReports() {
 
   for (const userId in userPortfolios) {
     const portfolio = userPortfolios[userId];
-
     for (const symbol in portfolio.stocks) {
       try {
         const response = await axios.get('https://finnhub.io/api/v1/calendar/earnings', {
-          params: {
-            symbol,
-            from: today,
-            to: today,
-            token: process.env.FINNHUB_API_KEY
-          }
+          params: { symbol, from: today, to: today, token: process.env.FINNHUB_API_KEY }
         });
 
         const earningsToday = response.data?.earningsCalendar?.some(r => r.symbol === symbol);
         if (earningsToday) {
           log.info(`📢 ${symbol} - דוח כספי היום. מחשבים סיכון מחדש...`);
-
           const price = await getFinnhubPrice(symbol);
           const stockData = {
             ticker: symbol,
@@ -178,6 +174,7 @@ async function checkEarningsReports() {
           const riskResult = await calculateAdvancedRisk(stockData);
           if (riskResult) {
             await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, price);
+            await sendPushNotification(userId, `📢 עדכון סיכון למניה ${symbol} בעקבות דוחות כספיים`);
           }
         }
       } catch (err) {
@@ -206,17 +203,8 @@ async function checkAndUpdatePrices() {
 
         log.info(`${userId} - ${symbol}: $${price} (סטופ לוס: ${portfolio.stocks[symbol].stopLoss})`);
 
-        await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
-
-        let shouldRecalculateRisk = false;
-        if (prevPrice === null || prevPrice === 0) {
-          shouldRecalculateRisk = true;
-        } else {
-          const changePercent = Math.abs(price - prevPrice) / prevPrice * 100;
-          if (changePercent >= 5) shouldRecalculateRisk = true;
-        }
-
-        if (shouldRecalculateRisk) {
+        // ✅ שלב חדש - אם אין stopLoss בכלל, נחשב מיידית
+        if (!portfolio.stocks[symbol].stopLoss) {
           const stockData = {
             ticker: symbol,
             currentPrice: price,
@@ -230,7 +218,30 @@ async function checkAndUpdatePrices() {
             const { shouldSell, newStopLoss } = await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, price);
             if (shouldSell) {
               await sellStock(userId, symbol, portfolio.stocks[symbol].quantity, price);
-              log.info(`💸 מכירה בעקבות סטופ לוס: ${symbol} במחיר $${price}`);
+              await sendPushNotification(userId, `💸 מכירה בוצעה אוטומטית: ${symbol} במחיר $${price}`);
+            }
+          }
+        }
+
+        await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
+
+        // ✅ בדיקת שינוי חד
+        const changePercent = prevPrice ? Math.abs(price - prevPrice) / prevPrice * 100 : 0;
+        if (changePercent >= 5) {
+          const stockData = {
+            ticker: symbol,
+            currentPrice: price,
+            quantity: portfolio.stocks[symbol].quantity || 1,
+            amountInvested: portfolio.stocks[symbol].amountInvested || price * (portfolio.stocks[symbol].quantity || 1),
+            sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
+          };
+
+          const riskResult = await calculateAdvancedRisk(stockData);
+          if (riskResult) {
+            const { shouldSell, newStopLoss } = await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, price);
+            if (shouldSell) {
+              await sellStock(userId, symbol, portfolio.stocks[symbol].quantity, price);
+              await sendPushNotification(userId, `💸 מכירה בוצעה אוטומטית: ${symbol} במחיר $${price}`);
             }
           }
         }
@@ -245,11 +256,12 @@ async function checkAndUpdatePrices() {
 async function sellStock(userId, symbol, quantity, price) {
   const portfolio = userPortfolios[userId];
   if (!portfolio || !portfolio.alpacaKeys) {
-    log.warn(`🚫 אין Alpaca למשתמש ${userId} - סימולציית מכירה בלבד`);
-    portfolio.userNotifications.push({
+    const msg = `📢 הגיע הזמן למכור את ${symbol} לפי סימולציה`;
+    log.warn(`🚫 אין Alpaca למשתמש ${userId} - ${msg}`);
+    await sendAllNotifications(userId, portfolio, {
       id: Date.now() + Math.random(),
       type: 'simulated_sell',
-      message: `📢 הגיע הזמן למכור את ${symbol} לפי סימולציה`,
+      message: msg,
       timestamp: new Date().toISOString(),
       stockTicker: symbol,
       read: false
@@ -275,11 +287,12 @@ async function sellStock(userId, symbol, quantity, price) {
       time_in_force: 'day'
     });
 
-    log.info(`🚀 מכירה בוצעה ב-Alpaca עבור ${symbol} - כמות: ${quantity}`);
-    portfolio.userNotifications.push({
+    const msg = `💸 בוצעה מכירה אוטומטית למניה ${symbol} בכמות ${quantity}`;
+    log.info(msg);
+    await sendAllNotifications(userId, portfolio, {
       id: Date.now() + Math.random(),
       type: 'sell_order',
-      message: `💸 בוצעה מכירה אוטומטית למניה ${symbol} בכמות ${quantity}`,
+      message: msg,
       timestamp: new Date().toISOString(),
       stockTicker: symbol,
       read: false
@@ -306,13 +319,13 @@ app.listen(PORT, () => {
   setInterval(checkAndUpdatePrices, 5 * 60 * 1000); // כל 5 דקות
 });
 
-// ✅ תזמון שבועי: כל יום שישי ב-14:00
+// תזמון שבועי: כל שישי ב-14:00
 cron.schedule('0 14 * * 5', () => {
-  log.info('📆 ריצת חישוב שבועית (יום שישי)');
+  log.info('📆 ריצת חישוב שבועית (שישי)');
   checkAndUpdatePrices();
 });
 
-// ✅ תזמון יומי לבדוק דוחות כספיים כל יום ב-10:00
+// תזמון יומי לבדוק דוחות כספיים
 cron.schedule('0 10 * * *', () => {
   log.info('📊 בדיקת דוחות כספיים יומית');
   checkEarningsReports();
