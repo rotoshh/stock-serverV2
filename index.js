@@ -11,8 +11,31 @@ const { sendPushNotification } = require('./pushServices');
 const log = console;
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// ---- CORS + JSON SAFE ----
+const allowedOrigins = [
+  'https://app.base44.com/apps/684c3006b888b466396ab87e/editor/preview/Dashboard',   // החלף בדומיין של האתר ב-VibeCoding
+  'http://localhost:3000',          // לפיתוח מקומי (אם צריך)
+];
+
+app.use(cors({
+  origin: (origin, cb) => {
+    // לאפשר גם Postman/שרתים ללא Origin
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    // לא לאפשר דומיינים לא מוכרים
+    return cb(new Error('Not allowed by CORS: ' + origin));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+}));
+
+// לאפשר Preflight לכל הנתיבים
+app.options('*', cors());
+
+// להגדיל את מגבלת גוף ה-JSON (למקרה של תיקים גדולים)
+app.use(express.json({ limit: '1mb' }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -326,7 +349,7 @@ app.get('/portfolio/:userId', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   log.info(`✅ Server started on port ${PORT}`);
-  setInterval(checkAndUpdatePrices, 5 * 60 * 1000); // כל 5 דקות
+  setInterval(checkAndUpdatePrices, 5 * 60 * 1000);
 });
 
 cron.schedule('0 14 * * 5', () => {
