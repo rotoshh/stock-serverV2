@@ -12,30 +12,47 @@ const log = console;
 
 const app = express();
 
-// ---- CORS + JSON SAFE ----
+/* ========= CORS + JSON SAFE ========= */
+
+// שים כאן רק דומיינים (ללא path!)
 const allowedOrigins = [
-  'https://app.base44.com/apps/684c3006b888b466396ab87e/editor/preview/Dashboard',   // החלף בדומיין של האתר ב-VibeCoding
-  'http://localhost:3000',          // לפיתוח מקומי (אם צריך)
+  'https://app.base44.com', // דומיין האפליקציה ב-VibeCoding/Base44 (ללא /apps/...)
+  'http://localhost:3000'   // לפיתוח מקומי (אם צריך)
 ];
 
-app.use(cors({
-  origin: (origin, cb) => {
-    // לאפשר גם Postman/שרתים ללא Origin
-    if (!origin) return cb(null, true);
-    if (allowedOrigins.includes(origin)) return cb(null, true);
-    // לא לאפשר דומיינים לא מוכרים
-    return cb(new Error('Not allowed by CORS: ' + origin));
-  },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
+// CORS דינאמי עם לוגים
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (!origin || allowedOrigins.includes(origin)) {
+    return cors({
+      origin: origin || true,
+      methods: ['GET','POST','OPTIONS'],
+      allowedHeaders: ['Content-Type','Authorization'],
+      credentials: true
+    })(req, res, next);
+  }
+  log.warn(`CORS blocked request from origin: ${origin}`);
+  // החזר שגיאת CORS תקינה
+  res.status(403).json({ error: `Not allowed by CORS: ${origin}` });
+});
 
-// לאפשר Preflight לכל הנתיבים
-app.options('*', cors());
+// טיפול מסודר בבקשות OPTIONS בלי path-to-regexp
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+    res.header('Vary', 'Origin'); // כדי לאפשר קאשינג נכון
+    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    return res.sendStatus(204);
+  }
+  next();
+});
 
-// להגדיל את מגבלת גוף ה-JSON (למקרה של תיקים גדולים)
+// הגדלת מגבלת גוף JSON (תיקים גדולים)
 app.use(express.json({ limit: '1mb' }));
+
+/* ========== לוגיקת האפליקציה ========== */
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -74,7 +91,7 @@ async function calculateAdvancedRisk(stockData, userId) {
       .replace('{SECTOR}', stockData.sector || 'לא מוגדר');
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-3.5-turbo',
+      model: 'gpt-3.5-turbo', // שים לב: ייתכן שלא זמין/חינמי; עדכן לפי הצורך
       messages: [{ role: 'user', content: prompt }],
       response_format: { type: 'json_object' }
     });
@@ -352,6 +369,7 @@ app.listen(PORT, () => {
   setInterval(checkAndUpdatePrices, 5 * 60 * 1000);
 });
 
+/* ========== CRON JOBS ========== */
 cron.schedule('0 14 * * 5', () => {
   log.info('📆 ריצת חישוב שבועית (שישי)');
   checkAndUpdatePrices();
