@@ -16,7 +16,7 @@ const app = express();
 
 // שים כאן רק דומיינים (ללא path!)
 const allowedOrigins = [
-  'https://app.base44.com', // דומיין האפליקציה ב-VibeCoding/Base44 (ללא /apps/...)
+  'https://preview--risk-wise-396ab87e.base44.app', // דומיין האפליקציה ב-VibeCoding/Base44 (ללא /apps/...)
   'http://localhost:3000'   // לפיתוח מקומי (אם צריך)
 ];
 
