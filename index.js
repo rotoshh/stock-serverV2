@@ -2,73 +2,69 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const OpenAI = require('openai');
+// ❌ לא צריך OpenAI יותר
+// const OpenAI = require('openai');
 const cron = require('node-cron');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
 const { sendEmail } = require('./emailService');
 const { sendPushNotification } = require('./pushServices');
-const log = console;
+// ✅ לקוח Hugging Face החדש
+const { generateJSONFromHF } = require('./hfClient');
 
+const log = console;
 const app = express();
 
-/* ========= CORS + JSON SAFE ========= */
-
-// שים כאן רק דומיינים (ללא path!)
+// ---- CORS + JSON SAFE ----
+// שים לב: ב-CORS צריך דומיין בלבד (ללא path)
 const allowedOrigins = [
-  'https://preview--risk-wise-396ab87e.base44.app', // דומיין האפליקציה ב-VibeCoding/Base44 (ללא /apps/...)
-  'http://localhost:3000'   // לפיתוח מקומי (אם צריך)
+  'https://app.base44.com', // דומיין של VibeCoding/Base44
+  'http://localhost:3000',  // לפיתוח מקומי
 ];
 
-// CORS דינאמי עם לוגים
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (!origin || allowedOrigins.includes(origin)) {
-    return cors({
-      origin: origin || true,
-      methods: ['GET','POST','OPTIONS'],
-      allowedHeaders: ['Content-Type','Authorization'],
-      credentials: true
-    })(req, res, next);
-  }
-  log.warn(`CORS blocked request from origin: ${origin}`);
-  // החזר שגיאת CORS תקינה
-  res.status(403).json({ error: `Not allowed by CORS: ${origin}` });
-});
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // מאפשר Postman/ברירת מחדל
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS: ' + origin));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+}));
 
-// טיפול מסודר בבקשות OPTIONS בלי path-to-regexp
-app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') {
-    res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-    res.header('Vary', 'Origin'); // כדי לאפשר קאשינג נכון
-    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
-    res.header('Access-Control-Allow-Credentials', 'true');
-    return res.sendStatus(204);
-  }
-  next();
-});
-
-// הגדלת מגבלת גוף JSON (תיקים גדולים)
+app.options('*', cors());
 app.use(express.json({ limit: '1mb' }));
 
-/* ========== לוגיקת האפליקציה ========== */
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// ❌ אין צורך באתחול OpenAI
+// const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const userPortfolios = {};
 const userPrices = {};
 const priceHistory15Min = {};
 const userRiskCache = {};
 
-const PROMPT_TEMPLATE = `בצע ניתוח סיכון מתקדם וכמותי ברמה מוסדית עבור המניה {TICKER} כדי לקבוע ציון סיכון מדויק.
-*פרטי השקעה:*
+const PROMPT_TEMPLATE = `
+אתה מנוע סיכון כמותי. החזר JSON חוקי *בלבד* (ללא טקסט נוסף, ללא backticks).
+השדות והפורמט המדויקים:
+{
+  "risk_score": number (1-10),
+  "stop_loss_percent": number,      // למשל 8.5 עבור 8.5%
+  "stop_loss_price": number,        // מחיר סטופ לוס מומלץ
+  "rationale": string               // נימוק קצר (עד 40 מילים)
+}
+
+נתוני המניה:
+- טיקר: {TICKER}
 - מחיר נוכחי: {CURRENT_PRICE}
 - כמות: {QUANTITY}
 - סכום מושקע: {AMOUNT_INVESTED}
 - סקטור: {SECTOR}
-...
-*תן ציון סיכון סופי מ-1 עד 10 מבוסס על ניתוח כמותי מדויק.*`;
+
+חוקים:
+- החזר JSON חוקי בלבד.
+- ודא ש-"stop_loss_price" עקבי עם "stop_loss_percent" והמחיר הנוכחי.
+`;
 
 async function calculateAdvancedRisk(stockData, userId) {
   try {
@@ -90,21 +86,36 @@ async function calculateAdvancedRisk(stockData, userId) {
       .replace('{AMOUNT_INVESTED}', stockData.amountInvested)
       .replace('{SECTOR}', stockData.sector || 'לא מוגדר');
 
-    const response = await openai.chat.completions.create({
-      model: 'gpt-3.5-turbo', // שים לב: ייתכן שלא זמין/חינמי; עדכן לפי הצורך
-      messages: [{ role: 'user', content: prompt }],
-      response_format: { type: 'json_object' }
-    });
+    // ✅ קריאה למודל הפתוח ב-Hugging Face במקום OpenAI
+    const result = await generateJSONFromHF(prompt);
 
-    const result = JSON.parse(response.choices[0].message.content);
+    // ולידציה/תיקון בסיסיים
+    const risk_score = Number(result.risk_score);
+    let stop_loss_percent = Number(result.stop_loss_percent);
+    let stop_loss_price = Number(result.stop_loss_price);
+
+    if (!Number.isFinite(stop_loss_percent) || stop_loss_percent <= 0 || stop_loss_percent >= 90) {
+      stop_loss_percent = 10; // ברירת מחדל שמרנית
+    }
+    if (!Number.isFinite(stop_loss_price) || stop_loss_price <= 0) {
+      stop_loss_price = currentPrice * (1 - stop_loss_percent / 100);
+    }
+
+    const clean = {
+      risk_score: Number.isFinite(risk_score) ? Math.min(Math.max(risk_score, 1), 10) : 5,
+      stop_loss_percent: +stop_loss_percent.toFixed(2),
+      stop_loss_price: +stop_loss_price.toFixed(2),
+      rationale: String(result.rationale || '').slice(0, 200)
+    };
+
     userRiskCache[userId][ticker] = {
       price: currentPrice,
-      result,
+      result: clean,
       timestamp: Date.now()
     };
 
-    log.info(`✅ Risk score for ${ticker}: ${result.risk_score}`);
-    return result;
+    log.info(`✅ Risk score for ${ticker}: ${clean.risk_score}, SL: ${clean.stop_loss_price} (${clean.stop_loss_percent}%)`);
+    return clean;
   } catch (error) {
     log.error(`❌ Error in risk calculation for ${stockData.ticker}: ${error.message}`);
     return null;
@@ -120,7 +131,12 @@ async function sendAllNotifications(userId, portfolio, notification) {
 async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData, currentPrice) {
   const oldStopLoss = portfolio.stocks[stockSymbol].stopLoss || 0;
   const riskLevelPercent = portfolio.portfolioRiskLevel || 10;
-  const newStopLoss = currentPrice * (1 - riskLevelPercent / 100);
+
+  // ✅ אם המודל נתן stop_loss_price נשתמש בו, אחרת לפי רמת הסיכון בתיק
+  const modelStop = riskData?.stop_loss_price;
+  const newStopLoss = Number.isFinite(modelStop)
+    ? Number(modelStop)
+    : currentPrice * (1 - riskLevelPercent / 100);
 
   if (Math.abs(newStopLoss - oldStopLoss) > 0.01) {
     portfolio.stocks[stockSymbol].stopLoss = newStopLoss;
@@ -153,7 +169,7 @@ app.post('/update-portfolio', (req, res) => {
   const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
   if (!userId || !stocks || !userEmail || !portfolioRiskLevel || !totalInvestment) {
     return res.status(400).json({ error: 'חסרים נתונים נדרשים' });
-  }
+    }
 
   userPortfolios[userId] = {
     stocks,
@@ -354,7 +370,7 @@ async function checkAndUpdatePrices() {
 }
 
 app.get('/', (req, res) => {
-  res.send('RiskWise Auto-Trader API Online');
+  res.send('RiskWise Auto-Trader API Online (HF Inference)');
 });
 
 app.get('/portfolio/:userId', (req, res) => {
@@ -369,7 +385,6 @@ app.listen(PORT, () => {
   setInterval(checkAndUpdatePrices, 5 * 60 * 1000);
 });
 
-/* ========== CRON JOBS ========== */
 cron.schedule('0 14 * * 5', () => {
   log.info('📆 ריצת חישוב שבועית (שישי)');
   checkAndUpdatePrices();
