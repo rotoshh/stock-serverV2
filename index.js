@@ -29,7 +29,7 @@ app.use(cors({
   credentials: true
 }));
 
-app.options('*', cors());
+app.options('/:any*', cors());
 app.use(express.json({ limit: '1mb' }));
 
 // ====== MEMORY DB ======
