@@ -14,7 +14,7 @@ const app = express();
 
 // ---- CORS + JSON SAFE ----
 const allowedOrigins = [
-  'https://app.base44.com', // דומיין של VibeCoding/Base44
+  ' https://preview--risk-wise-396ab87e.base44.app', // דומיין של VibeCoding/Base44
   'http://localhost:3000',  // לפיתוח מקומי
 ];
 
