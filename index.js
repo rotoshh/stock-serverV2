@@ -2,21 +2,17 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-// ❌ לא צריך OpenAI יותר
-// const OpenAI = require('openai');
 const cron = require('node-cron');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
 const { sendEmail } = require('./emailService');
 const { sendPushNotification } = require('./pushServices');
-// ✅ לקוח Hugging Face החדש
 const { generateJSONFromHF } = require('./hfClient');
 
 const log = console;
 const app = express();
 
 // ---- CORS + JSON SAFE ----
-// שים לב: ב-CORS צריך דומיין בלבד (ללא path)
 const allowedOrigins = [
   'https://app.base44.com', // דומיין של VibeCoding/Base44
   'http://localhost:3000',  // לפיתוח מקומי
@@ -36,22 +32,21 @@ app.use(cors({
 app.options('*', cors());
 app.use(express.json({ limit: '1mb' }));
 
-// ❌ אין צורך באתחול OpenAI
-// const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
+// ====== MEMORY DB ======
 const userPortfolios = {};
 const userPrices = {};
 const priceHistory15Min = {};
 const userRiskCache = {};
 
+// ====== PROMPT TEMPLATE ======
 const PROMPT_TEMPLATE = `
 אתה מנוע סיכון כמותי. החזר JSON חוקי *בלבד* (ללא טקסט נוסף, ללא backticks).
 השדות והפורמט המדויקים:
 {
   "risk_score": number (1-10),
-  "stop_loss_percent": number,      // למשל 8.5 עבור 8.5%
-  "stop_loss_price": number,        // מחיר סטופ לוס מומלץ
-  "rationale": string               // נימוק קצר (עד 40 מילים)
+  "stop_loss_percent": number,      
+  "stop_loss_price": number,        
+  "rationale": string               
 }
 
 נתוני המניה:
@@ -66,6 +61,7 @@ const PROMPT_TEMPLATE = `
 - ודא ש-"stop_loss_price" עקבי עם "stop_loss_percent" והמחיר הנוכחי.
 `;
 
+// ====== FUNCTIONS ======
 async function calculateAdvancedRisk(stockData, userId) {
   try {
     const { ticker, currentPrice } = stockData;
@@ -86,16 +82,14 @@ async function calculateAdvancedRisk(stockData, userId) {
       .replace('{AMOUNT_INVESTED}', stockData.amountInvested)
       .replace('{SECTOR}', stockData.sector || 'לא מוגדר');
 
-    // ✅ קריאה למודל הפתוח ב-Hugging Face במקום OpenAI
     const result = await generateJSONFromHF(prompt);
 
-    // ולידציה/תיקון בסיסיים
     const risk_score = Number(result.risk_score);
     let stop_loss_percent = Number(result.stop_loss_percent);
     let stop_loss_price = Number(result.stop_loss_price);
 
     if (!Number.isFinite(stop_loss_percent) || stop_loss_percent <= 0 || stop_loss_percent >= 90) {
-      stop_loss_percent = 10; // ברירת מחדל שמרנית
+      stop_loss_percent = 10;
     }
     if (!Number.isFinite(stop_loss_price) || stop_loss_price <= 0) {
       stop_loss_price = currentPrice * (1 - stop_loss_percent / 100);
@@ -132,7 +126,6 @@ async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData,
   const oldStopLoss = portfolio.stocks[stockSymbol].stopLoss || 0;
   const riskLevelPercent = portfolio.portfolioRiskLevel || 10;
 
-  // ✅ אם המודל נתן stop_loss_price נשתמש בו, אחרת לפי רמת הסיכון בתיק
   const modelStop = riskData?.stop_loss_price;
   const newStopLoss = Number.isFinite(modelStop)
     ? Number(modelStop)
@@ -164,25 +157,6 @@ async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData,
   }
   return { shouldSell: false };
 }
-
-app.post('/update-portfolio', (req, res) => {
-  const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
-  if (!userId || !stocks || !userEmail || !portfolioRiskLevel || !totalInvestment) {
-    return res.status(400).json({ error: 'חסרים נתונים נדרשים' });
-    }
-
-  userPortfolios[userId] = {
-    stocks,
-    alpacaKeys,
-    userEmail,
-    portfolioRiskLevel,
-    totalInvestment,
-    userNotifications: []
-  };
-
-  log.info(`📁 תיק עודכן עבור משתמש ${userId}`);
-  res.json({ message: 'התיק נשמר בהצלחה' });
-});
 
 async function sellStock(userId, symbol, quantity, price) {
   const portfolio = userPortfolios[userId];
@@ -369,8 +343,28 @@ async function checkAndUpdatePrices() {
   }
 }
 
+// ====== ROUTES ======
 app.get('/', (req, res) => {
   res.send('RiskWise Auto-Trader API Online (HF Inference)');
+});
+
+app.post('/update-portfolio', (req, res) => {
+  const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
+  if (!userId || !stocks || !userEmail || !portfolioRiskLevel || !totalInvestment) {
+    return res.status(400).json({ error: 'חסרים נתונים נדרשים' });
+  }
+
+  userPortfolios[userId] = {
+    stocks,
+    alpacaKeys,
+    userEmail,
+    portfolioRiskLevel,
+    totalInvestment,
+    userNotifications: []
+  };
+
+  log.info(`📁 תיק עודכן עבור משתמש ${userId}`);
+  res.json({ message: 'התיק נשמר בהצלחה' });
 });
 
 app.get('/portfolio/:userId', (req, res) => {
@@ -379,6 +373,7 @@ app.get('/portfolio/:userId', (req, res) => {
   res.json(portfolio);
 });
 
+// ====== JOBS ======
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   log.info(`✅ Server started on port ${PORT}`);
