@@ -1,41 +1,34 @@
-// hfClient.js
-const axios = require('axios');
+const axios = require("axios");
 
-/**
- * פונקציה שמבצעת קריאה ל-Hugging Face Inference API
- * מקבלת טקסט prompt ומחזירה JSON מנותח
- */
 async function generateJSONFromHF(prompt) {
   try {
     const response = await axios.post(
-      "https://api-inference.huggingface.co/models/tiiuae/falcon-7b-instruct",
+      "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2",
       { inputs: prompt },
       {
         headers: {
           Authorization: `Bearer ${process.env.HF_API_KEY}`,
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
         },
-        timeout: 60000 // טיים-אאוט של דקה
       }
     );
 
-    const data = response.data;
+    if (response.data.error) {
+      console.error("❌ Hugging Face API Error:", response.data.error);
+      return {};
+    }
 
-    // במקרה שהמודל מחזיר טקסט ארוך
-    const generated = Array.isArray(data)
-      ? data[0]?.generated_text || ""
-      : data.generated_text || "";
-
-    // מנסים לפרסר ל-JSON
+    // במקרה שמודל מחזיר מערך של אובייקטים
+    const raw = response.data[0]?.generated_text || "";
     try {
-      return JSON.parse(generated);
-    } catch (e) {
-      console.error("⚠️ Failed to parse JSON from Hugging Face output:", generated);
+      return JSON.parse(raw);
+    } catch (err) {
+      console.error("⚠️ JSON parse failed, raw output:", raw);
       return {};
     }
   } catch (err) {
-    console.error("❌ Hugging Face API Error:", err.response?.status, err.response?.data || err.message);
-    throw err;
+    console.error("❌ Error in Hugging Face request:", err.response?.data || err.message);
+    return {};
   }
 }
 
