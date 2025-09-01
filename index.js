@@ -5,8 +5,6 @@ const axios = require('axios');
 const cron = require('node-cron');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
-const { sendEmail } = require('./emailService');
-const { sendPushNotification } = require('./pushServices');
 const { generateJSONFromHF } = require('./hfClient');
 
 const log = console;
@@ -36,7 +34,7 @@ const userPortfolios = {};
 const userPrices = {};
 const priceHistory15Min = {};
 const userRiskCache = {};
-const sseClients = {}; // 👈 לקוחות SSE לכל משתמש
+const sseClients = {}; // לקוחות SSE
 
 // ====== PROMPT TEMPLATE ======
 const PROMPT_TEMPLATE = `
@@ -102,49 +100,6 @@ async function calculateAdvancedRisk(stockData, userId) {
   }
 }
 
-async function updateStopLossAndNotify(userId, stockSymbol, portfolio, riskData, currentPrice) {
-  const oldStopLoss = portfolio.stocks[stockSymbol].stopLoss || 0;
-  const newStopLoss = riskData?.stop_loss_price || currentPrice * 0.9;
-
-  if (Math.abs(newStopLoss - oldStopLoss) > 0.01) {
-    portfolio.stocks[stockSymbol].stopLoss = newStopLoss;
-
-    await sendEmail({
-      to: portfolio.userEmail,
-      subject: `📉 Stop Loss עדכון`,
-      html: `<p>סטופ לוס עודכן ל: $${newStopLoss.toFixed(2)}</p>`
-    });
-
-    await sendPushNotification(userId, `סטופ לוס חדש למניה ${stockSymbol}: $${newStopLoss.toFixed(2)}`);
-
-    if (currentPrice <= newStopLoss) {
-      return { shouldSell: true };
-    }
-  }
-  return { shouldSell: false };
-}
-
-async function sellStock(userId, symbol, quantity, price) {
-  const portfolio = userPortfolios[userId];
-  if (!portfolio?.alpacaKeys) {
-    await sendPushNotification(userId, `📢 סימולציית מכירה ${symbol}`);
-    return;
-  }
-  try {
-    const { key, secret } = portfolio.alpacaKeys;
-    const alpacaApi = axios.create({
-      baseURL: 'https://paper-api.alpaca.markets',
-      headers: { 'APCA-API-KEY-ID': key, 'APCA-API-SECRET-KEY': secret }
-    });
-    await alpacaApi.post('/v2/orders', {
-      symbol, qty: quantity, side: 'sell', type: 'market', time_in_force: 'day'
-    });
-    await sendPushNotification(userId, `💸 נמכרה מניה ${symbol}`);
-  } catch (err) {
-    log.error(`❌ Alpaca error ${symbol}: ${err.message}`);
-  }
-}
-
 async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
   if (!priceHistory15Min[userId]) priceHistory15Min[userId] = {};
   const now = Date.now();
@@ -160,8 +115,8 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
         sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
       }, userId);
       if (riskResult) {
-        const { shouldSell } = await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, currentPrice);
-        if (shouldSell) await sellStock(userId, symbol, portfolio.stocks[symbol].quantity, currentPrice);
+        portfolio.stocks[symbol].stopLoss = riskResult.stop_loss_price;
+        portfolio.stocks[symbol].risk = riskResult.risk_score;
       }
     }
   }
@@ -180,22 +135,30 @@ async function checkAndUpdatePrices() {
           : await getFinnhubPrice(symbol);
 
         userPrices[userId][symbol] = { price, time: Date.now() };
-        log.info(`${userId} - ${symbol}: $${price}`);
 
-        if (!portfolio.stocks[symbol].stopLoss) {
-          const riskResult = await calculateAdvancedRisk({
-            ticker: symbol, currentPrice: price,
-            quantity: portfolio.stocks[symbol].quantity || 1,
-            amountInvested: portfolio.stocks[symbol].amountInvested || price,
-            sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
-          }, userId);
-          if (riskResult) await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, price);
+        // חישוב AI לסטופ לוס וריסק
+        const riskResult = await calculateAdvancedRisk({
+          ticker: symbol,
+          currentPrice: price,
+          quantity: portfolio.stocks[symbol].quantity || 1,
+          amountInvested: portfolio.stocks[symbol].amountInvested || price,
+          sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
+        }, userId);
+
+        if (riskResult) {
+          portfolio.stocks[symbol].stopLoss = riskResult.stop_loss_price;
+          portfolio.stocks[symbol].risk = riskResult.risk_score;
         }
 
         await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
 
-        // 🔴 שולח עדכון ל-Frontend ב-SSE
-        pushUpdate(userId, { stockTicker: symbol, price, stopLoss: portfolio.stocks[symbol].stopLoss || null });
+        // שליחה ל-Frontend
+        pushUpdate(userId, {
+          stockTicker: symbol,
+          price,
+          stopLoss: portfolio.stocks[symbol].stopLoss || null,
+          risk: portfolio.stocks[symbol].risk || null
+        });
 
       } catch (err) {
         log.error(`❌ Error price ${symbol}: ${err.message}`);
@@ -209,7 +172,7 @@ app.get('/', (req, res) => res.send('✅ RiskWise API Online'));
 
 app.post('/update-portfolio', (req, res) => {
   const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
-  userPortfolios[userId] = { stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment, userNotifications: [] };
+  userPortfolios[userId] = { stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment };
   res.json({ message: 'Portfolio updated' });
 });
 
