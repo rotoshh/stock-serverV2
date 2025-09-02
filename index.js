@@ -1,11 +1,11 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
 const cron = require('node-cron');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
 const { generateJSONFromHF } = require('./hfClient');
+
 const log = console;
 const app = express();
 
@@ -65,6 +65,7 @@ async function calculateAdvancedRisk(stockData, userId) {
   try {
     const { ticker, currentPrice } = stockData;
     if (!userRiskCache[userId]) userRiskCache[userId] = {};
+
     const cached = userRiskCache[userId][ticker];
     if (cached) {
       const changePercent = Math.abs(currentPrice - cached.price) / cached.price * 100;
@@ -94,8 +95,8 @@ async function calculateAdvancedRisk(stockData, userId) {
     };
 
     userRiskCache[userId][ticker] = { price: currentPrice, result: clean };
-
     log.info(`✅ חישוב ריסק עבור ${ticker} (${userId}) →`, clean);
+
     return clean;
   } catch (e) {
     log.error(`❌ שגיאה בחישוב ריסק למניה ${stockData.ticker}: ${e.message}`);
@@ -118,6 +119,7 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
         amountInvested: portfolio.stocks[symbol].amountInvested || currentPrice,
         sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
       }, userId);
+
       if (riskResult) {
         portfolio.stocks[symbol].stopLoss = riskResult.stop_loss_price;
         portfolio.stocks[symbol].risk = riskResult.risk_score;
@@ -179,10 +181,12 @@ app.get('/', (req, res) => res.send('✅ RiskWise API Online'));
 app.post('/update-portfolio', (req, res) => {
   log.info("📥 התקבלה בקשת עדכון תיק:", req.body);
   const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
+
   if (!userId || !stocks) {
     log.error("❌ בקשה חסרה נתונים:", req.body);
     return res.status(400).json({ error: 'חסרים נתונים' });
   }
+
   userPortfolios[userId] = { stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment };
   log.info(`📁 תיק נשמר בהצלחה עבור ${userId}`);
   res.json({ message: 'Portfolio updated' });
@@ -222,6 +226,6 @@ app.get('/events/:userId', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   log.info(`✅ Server started on port ${PORT}`);
-  setInterval(checkAndUpdatePrices, 5 * 60 * 1000);
+  setInterval(checkAndUpdatePrices, 5 * 60 * 1000); // כל 5 דק'
 });
-cron.schedule('0 14 * * 5', checkAndUpdatePrices);
+cron.schedule('0 14 * * 5', checkAndUpdatePrices); // כל יום שישי
