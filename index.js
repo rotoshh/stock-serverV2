@@ -184,67 +184,6 @@ async function checkAndUpdatePrices() {
   }
 }
 
-// ====== FINNHUB WEBSOCKET ======
-function startFinnhubWebSocket() {
-  const ws = new WebSocket(`wss://ws.finnhub.io?token=${process.env.FINNHUB_API_KEY}`);
-
-  ws.on('open', () => {
-    log.info("🔌 מחובר ל-Finnhub WebSocket");
-    // רושם מניות לפי כל התיקים הקיימים
-    for (const userId in userPortfolios) {
-      for (const symbol in userPortfolios[userId].stocks) {
-        ws.send(JSON.stringify({ type: 'subscribe', symbol }));
-        log.info(`📡 נרשמתי ל-${symbol}`);
-      }
-    }
-  });
-
-  ws.on('message', async (message) => {
-    const data = JSON.parse(message);
-    if (data.type === 'trade') {
-      for (const trade of data.data) {
-        const { s: symbol, p: price } = trade;
-        for (const userId in userPortfolios) {
-          const portfolio = userPortfolios[userId];
-          if (portfolio.stocks[symbol]) {
-            userPrices[userId][symbol] = { price, time: Date.now() };
-            const riskResult = await calculateAdvancedRisk({
-              ticker: symbol,
-              currentPrice: price,
-              quantity: portfolio.stocks[symbol].quantity || 1,
-              amountInvested: portfolio.stocks[symbol].amountInvested || price,
-              sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
-            }, userId);
-
-            if (riskResult) {
-              portfolio.stocks[symbol].stopLoss = riskResult.stop_loss_price;
-              portfolio.stocks[symbol].risk = riskResult.risk_score;
-            }
-
-            pushUpdate(userId, {
-              stockTicker: symbol,
-              price,
-              stopLoss: portfolio.stocks[symbol].stopLoss,
-              risk: portfolio.stocks[symbol].risk
-            });
-
-            log.info(`⚡ עדכון בזמן אמת ${symbol} (${userId}): $${price}`);
-          }
-        }
-      }
-    }
-  });
-
-  ws.on('close', () => {
-    log.warn("⚠️ Finnhub WS נסגר, מנסה להתחבר מחדש...");
-    setTimeout(startFinnhubWebSocket, 5000);
-  });
-
-  ws.on('error', (err) => {
-    log.error("❌ שגיאת Finnhub WS:", err.message);
-  });
-}
-
 // ====== ROUTES ======
 app.get('/', (req, res) => res.send('✅ RiskWise API Online'));
 
@@ -297,6 +236,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   log.info(`✅ Server started on port ${PORT}`);
   setInterval(checkAndUpdatePrices, 60 * 1000); // כל דקה
-  startFinnhubWebSocket();
 });
-cron.schedule('0 14 * * 5', checkAndUpdatePrices);
+cron.schedule('0 14 * * 5', checkAndUpdatePrices); // כל יום שישי
