@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
+const fetch = require('node-fetch'); // נדרש לשליחת קריאות ל-Make
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
 const { generateJSONFromHF } = require('./hfClient');
@@ -32,6 +33,46 @@ const userPrices = {};
 const priceHistory15Min = {};
 const userRiskCache = {};
 const sseClients = {}; // לקוחות SSE
+
+// ====== MAKE NOTIFIER ======
+const lastAlerts = {}; // שמירה על התראות אחרונות כדי למנוע הצפה
+
+function alertKey(userId, symbol, type) {
+  return `${userId}:${symbol}:${type}`;
+}
+
+function shouldThrottle(userId, symbol, type, windowMs = 10 * 60 * 1000) {
+  const k = alertKey(userId, symbol, type);
+  const now = Date.now();
+  if (!lastAlerts[k] || (now - lastAlerts[k]) > windowMs) {
+    lastAlerts[k] = now;
+    return false;
+  }
+  return true;
+}
+
+async function notifyMake(event) {
+  try {
+    if (!process.env.MAKE_WEBHOOK_URL) return;
+
+    const res = await fetch(process.env.MAKE_WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Make-Token": process.env.MAKE_TOKEN || ""
+      },
+      body: JSON.stringify({
+        ...event,
+        source: "riskwise-server",
+        ts: new Date().toISOString()
+      })
+    });
+
+    log.info(`📤 נשלחה התראה ל-Make (${event.type}) → ${res.status}`);
+  } catch (err) {
+    log.error("❌ שגיאה בשליחת התראה ל-Make:", err.message);
+  }
+}
 
 // ====== PROMPT TEMPLATE ======
 const PROMPT_TEMPLATE = `
@@ -106,6 +147,18 @@ async function calculateAdvancedRisk(stockData, userId) {
     userRiskCache[userId][ticker] = { price: currentPrice, result: clean };
     log.info(`✅ חישוב ריסק עבור ${ticker} (${userId}) →`, clean);
 
+    // שליחת התראה ל-Make על עדכון סטופ לוס
+    if (!shouldThrottle(userId, ticker, "STOP_LOSS_UPDATED", 5 * 60 * 1000)) {
+      await notifyMake({
+        type: "STOP_LOSS_UPDATED",
+        userId,
+        symbol: ticker,
+        price: currentPrice,
+        stopLoss: clean.stop_loss_price,
+        risk: clean.risk_score
+      });
+    }
+
     return clean;
   } catch (e) {
     log.error(`❌ שגיאה בחישוב ריסק למניה ${stockData.ticker}: ${e.message}`);
@@ -122,6 +175,17 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
     const change = ((currentPrice - history.price) / history.price) * 100;
     if (change <= -5) {
       log.warn(`📉 ירידה ${change.toFixed(2)}% ב-15 דק' עבור ${symbol} (${userId})`);
+
+      if (!shouldThrottle(userId, symbol, "FIFTEEN_MIN_DROP", 10 * 60 * 1000)) {
+        await notifyMake({
+          type: "FIFTEEN_MIN_DROP",
+          userId,
+          symbol,
+          price: currentPrice,
+          changePercent: +change.toFixed(2)
+        });
+      }
+
       const riskResult = await calculateAdvancedRisk({
         ticker: symbol, currentPrice,
         quantity: portfolio.stocks[symbol].quantity || 1,
@@ -164,6 +228,19 @@ async function checkAndUpdatePrices() {
         if (riskResult) {
           portfolio.stocks[symbol].stopLoss = riskResult.stop_loss_price;
           portfolio.stocks[symbol].risk = riskResult.risk_score;
+        }
+
+        // בדיקת סטופ לוס
+        if (portfolio.stocks[symbol].stopLoss && price <= portfolio.stocks[symbol].stopLoss) {
+          if (!shouldThrottle(userId, symbol, "STOP_LOSS_HIT", 60 * 1000)) {
+            await notifyMake({
+              type: "STOP_LOSS_HIT",
+              userId,
+              symbol,
+              price,
+              stopLoss: portfolio.stocks[symbol].stopLoss
+            });
+          }
         }
 
         await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
