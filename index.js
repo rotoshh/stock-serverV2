@@ -301,6 +301,25 @@ app.get('/events/:userId', (req, res) => {
   });
 });
 
+// 🚨 ROUTE זמני לבדיקה ידנית של MAKE 🚨
+// אפשר למחוק/להעיר אחרי שסיימת לבדוק
+app.get('/test-make', async (req, res) => {
+  try {
+    await notifyMake({
+      type: "TEST_EVENT",
+      userId: "demoUser",
+      symbol: "AAPL",
+      price: 150,
+      stopLoss: 140,
+      risk: 5,
+      message: "זוהי בדיקת חיבור ידנית ל-Make"
+    });
+    res.json({ success: true, message: "התראה נשלחה ל-Make" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}); 
+
 // ====== JOBS ======
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
