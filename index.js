@@ -49,22 +49,14 @@ function shouldThrottle(userId, symbol, type, windowMs = 10 * 60 * 1000) {
   return true;
 }
 
+
 async function notifyMake(event) {
   try {
     if (!process.env.MAKE_WEBHOOK_URL) return;
 
-    // אפשר להפריד לפי סוג אירוע – למשל להוסיף query param שונה
-    let url = process.env.MAKE_WEBHOOK_URL;
-    if (event.type === "STOP_LOSS_HIT") url += "?branch=stopLoss";
-    if (event.type === "FIFTEEN_MIN_DROP") url += "?branch=drop15";
-    if (event.type === "STOP_LOSS_UPDATED") url += "?branch=updated";
-
-    const res = await fetch(url, {
+    const res = await fetch(process.env.MAKE_WEBHOOK_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         ...event,
         source: "riskwise-server",
