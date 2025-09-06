@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
-const fetch = require("node-fetch");
+const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
 const { generateJSONFromHF } = require('./hfClient');
