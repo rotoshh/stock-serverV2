@@ -63,7 +63,7 @@ async function notifyMake(event) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Make-Token": process.env.MAKE_TOKEN || ""
+        
       },
       body: JSON.stringify({
         ...event,
