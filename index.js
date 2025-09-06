@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
-const fetch = require('node-fetch'); // נדרש לשליחת קריאות ל-Make
+const fetch = require('node-fetch');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
 const { generateJSONFromHF } = require('./hfClient');
@@ -32,15 +32,13 @@ const userPortfolios = {};
 const userPrices = {};
 const priceHistory15Min = {};
 const userRiskCache = {};
-const sseClients = {}; // לקוחות SSE
+const sseClients = {}; 
 
 // ====== MAKE NOTIFIER ======
-const lastAlerts = {}; // שמירה על התראות אחרונות כדי למנוע הצפה
-
+const lastAlerts = {};
 function alertKey(userId, symbol, type) {
   return `${userId}:${symbol}:${type}`;
 }
-
 function shouldThrottle(userId, symbol, type, windowMs = 10 * 60 * 1000) {
   const k = alertKey(userId, symbol, type);
   const now = Date.now();
@@ -55,7 +53,13 @@ async function notifyMake(event) {
   try {
     if (!process.env.MAKE_WEBHOOK_URL) return;
 
-    const res = await fetch(process.env.MAKE_WEBHOOK_URL, {
+    // אפשר להפריד לפי סוג אירוע – למשל להוסיף query param שונה
+    let url = process.env.MAKE_WEBHOOK_URL;
+    if (event.type === "STOP_LOSS_HIT") url += "?branch=stopLoss";
+    if (event.type === "FIFTEEN_MIN_DROP") url += "?branch=drop15";
+    if (event.type === "STOP_LOSS_UPDATED") url += "?branch=updated";
+
+    const res = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -100,8 +104,6 @@ function pushUpdate(userId, data) {
     log.info(`📡 נשלח עדכון SSE ל-${userId}:`, data);
   }
 }
-
-// שמירה על חיבור SSE חי (ping כל 30 שניות)
 setInterval(() => {
   for (const userId in sseClients) {
     sseClients[userId].forEach(res => {
@@ -147,7 +149,6 @@ async function calculateAdvancedRisk(stockData, userId) {
     userRiskCache[userId][ticker] = { price: currentPrice, result: clean };
     log.info(`✅ חישוב ריסק עבור ${ticker} (${userId}) →`, clean);
 
-    // שליחת התראה ל-Make על עדכון סטופ לוס
     if (!shouldThrottle(userId, ticker, "STOP_LOSS_UPDATED", 5 * 60 * 1000)) {
       await notifyMake({
         type: "STOP_LOSS_UPDATED",
@@ -216,7 +217,6 @@ async function checkAndUpdatePrices() {
 
         userPrices[userId][symbol] = { price, time: Date.now() };
 
-        // חישוב AI לסטופ לוס וריסק
         const riskResult = await calculateAdvancedRisk({
           ticker: symbol,
           currentPrice: price,
@@ -230,7 +230,6 @@ async function checkAndUpdatePrices() {
           portfolio.stocks[symbol].risk = riskResult.risk_score;
         }
 
-        // בדיקת סטופ לוס
         if (portfolio.stocks[symbol].stopLoss && price <= portfolio.stocks[symbol].stopLoss) {
           if (!shouldThrottle(userId, symbol, "STOP_LOSS_HIT", 60 * 1000)) {
             await notifyMake({
@@ -245,7 +244,6 @@ async function checkAndUpdatePrices() {
 
         await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
 
-        // שליחה ל-Frontend
         pushUpdate(userId, {
           stockTicker: symbol,
           price,
@@ -267,12 +265,10 @@ app.get('/', (req, res) => res.send('✅ RiskWise API Online'));
 app.post('/update-portfolio', (req, res) => {
   log.info("📥 התקבלה בקשת עדכון תיק:", req.body);
   const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
-
   if (!userId || !stocks) {
     log.error("❌ בקשה חסרה נתונים:", req.body);
     return res.status(400).json({ error: 'חסרים נתונים' });
   }
-
   userPortfolios[userId] = { stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment };
   log.info(`📁 תיק נשמר בהצלחה עבור ${userId}`);
   res.json({ message: 'Portfolio updated' });
@@ -293,15 +289,12 @@ app.get('/portfolio/:userId', (req, res) => {
 app.get('/events/:userId', (req, res) => {
   const userId = req.params.userId;
   log.info(`📡 חיבור SSE נפתח עבור ${userId}`);
-
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
-
   if (!sseClients[userId]) sseClients[userId] = [];
   sseClients[userId].push(res);
-
   req.on('close', () => {
     log.warn(`❌ חיבור SSE נסגר עבור ${userId}`);
     sseClients[userId] = sseClients[userId].filter(r => r !== res);
@@ -312,6 +305,6 @@ app.get('/events/:userId', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   log.info(`✅ Server started on port ${PORT}`);
-  setInterval(checkAndUpdatePrices, 60 * 1000); // כל דקה
+  setInterval(checkAndUpdatePrices, 60 * 1000);
 });
-cron.schedule('0 14 * * 5', checkAndUpdatePrices); // כל יום שישי
+cron.schedule('0 14 * * 5', checkAndUpdatePrices);
