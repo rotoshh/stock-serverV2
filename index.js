@@ -5,7 +5,7 @@ const cron = require('node-cron');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
-const { generateJSONFromHF } = require('./hfClient');
+import { generateJSONFromHF } from './hfClient.js';
 
 const log = console;
 const app = express();

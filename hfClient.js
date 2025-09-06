@@ -1,4 +1,4 @@
-import fetch from "node-fetch";
+const fetch = require("node-fetch");
 
 async function generateJSONFromHF(prompt) {
   try {
@@ -26,4 +26,4 @@ async function generateJSONFromHF(prompt) {
   }
 }
 
-module.exports = { generateJSONFromHF };
+export { generateJSONFromHF };
