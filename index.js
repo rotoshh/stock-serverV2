@@ -3,9 +3,11 @@ const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
 const nodemailer = require('nodemailer');
+const fetch = require('node-fetch');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
 const { generateJSONFromHF } = require('./hfClient');
+
 const log = console;
 const app = express();
 
@@ -31,10 +33,10 @@ const userPortfolios = {};
 const userPrices = {};
 const priceHistory15Min = {};
 const userRiskCache = {};
-const sseClients = {}; 
+const sseClients = {}; // לקוחות SSE
 const lastAlerts = {}; // למניעת הצפה
 
-// ====== Nodemailer Transport ======
+// ====== EMAIL TRANSPORTER ======
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
@@ -43,23 +45,25 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-async function sendEmail(subject, text) {
+async function sendEmail(to, subject, text) {
   try {
     await transporter.sendMail({
       from: `"RiskWise Alerts" <${process.env.GMAIL_USER}>`,
-      to: process.env.ALERT_EMAIL,
+      to,
       subject,
       text
     });
-    log.info(`📧 נשלח מייל: ${subject}`);
+    log.info(`📧 נשלח מייל אל ${to}: ${subject}`);
   } catch (err) {
     log.error("❌ שגיאה בשליחת מייל:", err.message);
   }
 }
 
+// ====== MAKE NOTIFIER ======
 function alertKey(userId, symbol, type) {
   return `${userId}:${symbol}:${type}`;
 }
+
 function shouldThrottle(userId, symbol, type, windowMs = 10 * 60 * 1000) {
   const k = alertKey(userId, symbol, type);
   const now = Date.now();
@@ -68,6 +72,20 @@ function shouldThrottle(userId, symbol, type, windowMs = 10 * 60 * 1000) {
     return false;
   }
   return true;
+}
+
+async function notifyMake(event) {
+  try {
+    if (!process.env.MAKE_WEBHOOK_URL) return;
+    const res = await fetch(process.env.MAKE_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...event, ts: new Date().toISOString() })
+    });
+    log.info(`📤 נשלחה התראה ל-Make (${event.type}) → ${res.status}`);
+  } catch (err) {
+    log.error("❌ שגיאה בשליחת התראה ל-Make:", err.message);
+  }
 }
 
 // ====== PROMPT TEMPLATE ======
@@ -96,6 +114,8 @@ function pushUpdate(userId, data) {
     log.info(`📡 נשלח עדכון SSE ל-${userId}:`, data);
   }
 }
+
+// שמירה על חיבור SSE חי (ping כל 30 שניות)
 setInterval(() => {
   for (const userId in sseClients) {
     sseClients[userId].forEach(res => {
@@ -109,38 +129,44 @@ async function calculateAdvancedRisk(stockData, userId) {
   try {
     const { ticker, currentPrice } = stockData;
     if (!userRiskCache[userId]) userRiskCache[userId] = {};
+
     const cached = userRiskCache[userId][ticker];
     if (cached) {
       const changePercent = Math.abs(currentPrice - cached.price) / cached.price * 100;
-      if (changePercent < 5) {
-        log.info(`⚡ שימוש בנתוני מטמון לריסק ${ticker} עבור ${userId}`);
-        return cached.result;
-      }
+      if (changePercent < 5) return cached.result;
     }
+
     const prompt = PROMPT_TEMPLATE
       .replace('{TICKER}', ticker)
       .replace('{CURRENT_PRICE}', currentPrice)
       .replace('{QUANTITY}', stockData.quantity)
       .replace('{AMOUNT_INVESTED}', stockData.amountInvested)
       .replace('{SECTOR}', stockData.sector || 'לא מוגדר');
+
     const result = await generateJSONFromHF(prompt);
+
     let stop_loss_percent = Number(result.stop_loss_percent) || 10;
     let stop_loss_price = Number(result.stop_loss_price) || currentPrice * (1 - stop_loss_percent / 100);
+
     const clean = {
       risk_score: Math.min(Math.max(Number(result.risk_score) || 5, 1), 10),
       stop_loss_percent: +stop_loss_percent.toFixed(2),
       stop_loss_price: +stop_loss_price.toFixed(2),
       rationale: String(result.rationale || '').slice(0, 200)
     };
-    userRiskCache[userId][ticker] = { price: currentPrice, result: clean };
-    log.info(`✅ חישוב ריסק עבור ${ticker} (${userId}) →`, clean);
 
+    userRiskCache[userId][ticker] = { price: currentPrice, result: clean };
+
+    const portfolio = userPortfolios[userId];
     if (!shouldThrottle(userId, ticker, "STOP_LOSS_UPDATED", 5 * 60 * 1000)) {
       await sendEmail(
+        portfolio.userEmail || process.env.ALERT_EMAIL,
         `📊 Stop Loss Updated (${ticker})`,
         `משתמש: ${userId}\nמניה: ${ticker}\nמחיר נוכחי: ${currentPrice}\nStop Loss חדש: ${clean.stop_loss_price}\nRisk: ${clean.risk_score}`
       );
+      await notifyMake({ type: "STOP_LOSS_UPDATED", userId, symbol: ticker, ...clean });
     }
+
     return clean;
   } catch (e) {
     log.error(`❌ שגיאה בחישוב ריסק למניה ${stockData.ticker}: ${e.message}`);
@@ -152,25 +178,18 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
   if (!priceHistory15Min[userId]) priceHistory15Min[userId] = {};
   const now = Date.now();
   const history = priceHistory15Min[userId][symbol];
+
   if (history && now - history.time <= 15 * 60 * 1000) {
     const change = ((currentPrice - history.price) / history.price) * 100;
     if (change <= -5) {
-      log.warn(`📉 ירידה ${change.toFixed(2)}% ב-15 דק' עבור ${symbol} (${userId})`);
+      const portfolio = userPortfolios[userId];
       if (!shouldThrottle(userId, symbol, "FIFTEEN_MIN_DROP", 10 * 60 * 1000)) {
         await sendEmail(
+          portfolio.userEmail || process.env.ALERT_EMAIL,
           `📉 15min Drop Alert (${symbol})`,
           `משתמש: ${userId}\nמניה: ${symbol}\nירידה: ${change.toFixed(2)}%\nמחיר נוכחי: ${currentPrice}`
         );
-      }
-      const riskResult = await calculateAdvancedRisk({
-        ticker: symbol, currentPrice,
-        quantity: portfolio.stocks[symbol].quantity || 1,
-        amountInvested: portfolio.stocks[symbol].amountInvested || currentPrice,
-        sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
-      }, userId);
-      if (riskResult) {
-        portfolio.stocks[symbol].stopLoss = riskResult.stop_loss_price;
-        portfolio.stocks[symbol].risk = riskResult.risk_score;
+        await notifyMake({ type: "FIFTEEN_MIN_DROP", userId, symbol, price: currentPrice, changePercent: change.toFixed(2) });
       }
     }
   }
@@ -186,8 +205,8 @@ async function checkAndUpdatePrices() {
         let price = portfolio.alpacaKeys
           ? await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret)
           : await getFinnhubPrice(symbol);
-        userPrices[userId][symbol] = { price, time: Date.now() };
 
+        userPrices[userId][symbol] = { price, time: Date.now() };
         const riskResult = await calculateAdvancedRisk({
           ticker: symbol,
           currentPrice: price,
@@ -204,9 +223,11 @@ async function checkAndUpdatePrices() {
         if (portfolio.stocks[symbol].stopLoss && price <= portfolio.stocks[symbol].stopLoss) {
           if (!shouldThrottle(userId, symbol, "STOP_LOSS_HIT", 60 * 1000)) {
             await sendEmail(
+              portfolio.userEmail || process.env.ALERT_EMAIL,
               `🚨 Stop Loss Hit (${symbol})`,
               `משתמש: ${userId}\nמניה: ${symbol}\nמחיר נוכחי: ${price}\nStop Loss: ${portfolio.stocks[symbol].stopLoss}`
             );
+            await notifyMake({ type: "STOP_LOSS_HIT", userId, symbol, price, stopLoss: portfolio.stocks[symbol].stopLoss });
           }
         }
 
@@ -219,7 +240,6 @@ async function checkAndUpdatePrices() {
           risk: portfolio.stocks[symbol].risk || null
         });
 
-        log.info(`📊 ${symbol} (${userId}) → $${price} | SL: ${portfolio.stocks[symbol].stopLoss}`);
       } catch (err) {
         log.error(`❌ שגיאה במחיר ${symbol}: ${err.message}`);
       }
@@ -231,32 +251,21 @@ async function checkAndUpdatePrices() {
 app.get('/', (req, res) => res.send('✅ RiskWise API Online'));
 
 app.post('/update-portfolio', (req, res) => {
-  log.info("📥 התקבלה בקשת עדכון תיק:", req.body);
   const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
-  if (!userId || !stocks) {
-    log.error("❌ בקשה חסרה נתונים:", req.body);
-    return res.status(400).json({ error: 'חסרים נתונים' });
-  }
+  if (!userId || !stocks) return res.status(400).json({ error: 'חסרים נתונים' });
   userPortfolios[userId] = { stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment };
-  log.info(`📁 תיק נשמר בהצלחה עבור ${userId}`);
   res.json({ message: 'Portfolio updated' });
 });
 
 app.get('/portfolio/:userId', (req, res) => {
-  const userId = req.params.userId;
-  log.info(`🔍 בקשת שליפת תיק עבור ${userId}`);
-  const portfolio = userPortfolios[userId];
-  if (!portfolio) {
-    log.error(`❌ לא נמצא תיק עבור ${userId}`);
-    return res.status(404).json({ error: 'Not found' });
-  }
+  const portfolio = userPortfolios[req.params.userId];
+  if (!portfolio) return res.status(404).json({ error: 'Not found' });
   res.json(portfolio);
 });
 
 // 🔴 חיבור SSE
 app.get('/events/:userId', (req, res) => {
   const userId = req.params.userId;
-  log.info(`📡 חיבור SSE נפתח עבור ${userId}`);
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -264,7 +273,6 @@ app.get('/events/:userId', (req, res) => {
   if (!sseClients[userId]) sseClients[userId] = [];
   sseClients[userId].push(res);
   req.on('close', () => {
-    log.warn(`❌ חיבור SSE נסגר עבור ${userId}`);
     sseClients[userId] = sseClients[userId].filter(r => r !== res);
   });
 });
