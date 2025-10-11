@@ -6,8 +6,8 @@ const nodemailer = require('nodemailer');
 const fetch = require('node-fetch');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
-const { generateJSONFromHF } = require('./hfClient');
-const { calculateRiskAndStopLoss } = require('./riskCalculator');
+const { generateJSONFromBase44 } = require('./base44Client');
+const { calculateRiskAndStopLoss } = require('./base44Client');
 
 const log = console;
 const app = express();
@@ -36,6 +36,26 @@ const priceHistory15Min = {};
 const userRiskCache = {};
 const sseClients = {}; // לקוחות SSE
 const lastAlerts = {}; // למניעת הצפה
+
+// === פונקציה לשליחת prompt למודל Base44 דרך ה-API שלך ===
+async function generateJSONFromBase44(prompt) {
+  try {
+    const response = await axios.post('https://api.base44.ai/inference', {
+      prompt
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.BASE44_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    // נניח שהמודל מחזיר JSON ישירות
+    return response.data;
+  } catch (error) {
+    log.error(`❌ שגיאה בשליפת נתוני AI מ-Base44: ${error.message}`);
+    return {};
+  }
+}
 
 // ====== EMAIL TRANSPORTER ======
 const transporter = nodemailer.createTransport({
@@ -130,38 +150,64 @@ setInterval(() => {
 async function calculateAdvancedRisk(stockData, userId) {
   try {
     const { ticker, currentPrice } = stockData;
-    if (!userRiskCache[userId]) userRiskCache[userId] = {};
 
-    // בדיקת מטמון
+    // --- בדיקה אם יש תוצאה במטמון (Cache) ---
+    if (!userRiskCache[userId]) userRiskCache[userId] = {};
     const cached = userRiskCache[userId][ticker];
     if (cached) {
       const changePercent = Math.abs(currentPrice - cached.price) / cached.price * 100;
-      if (changePercent < 3) return cached.result;
+      if (changePercent < 5) {
+        log.info(`⚡ שימוש בנתוני מטמון לריסק ${ticker} עבור ${userId}`);
+        return cached.result;
+      }
     }
 
-    const portfolio = userPortfolios[userId];
-    const priceHistory = [currentPrice * 0.98, currentPrice * 1.01, currentPrice * 0.99, currentPrice * 1.02, currentPrice]; // זמני — תוכל להחליף בהיסטוריה אמיתית בהמשך
+    // --- הכנת ה-Prompt למודל ---
+    const prompt = `
+    אתה מנוע סיכון כמותי. החזר JSON חוקי בלבד.
+    {
+      "risk_score": number,
+      "stop_loss_percent": number,
+      "stop_loss_price": number,
+      "rationale": string
+    }
+    נתוני המניה:
+    - טיקר: ${ticker}
+    - מחיר נוכחי: ${currentPrice}
+    - כמות: ${stockData.quantity}
+    - סכום מושקע: ${stockData.amountInvested}
+    - סקטור: ${stockData.sector || 'לא מוגדר'}
+    `;
 
-    const stock = {
-      ticker,
-      entry_price: stockData.amountInvested || currentPrice,
-      sector: stockData.sector || 'לא ידוע',
-    };
+    // --- קריאה למודל Base44 או למודל שלך במייק ---
+    const result = await generateJSONFromBase44(prompt);
 
-    // כאן הקריאה למודל של Base44
-    const result = calculateRiskAndStopLoss(stock, priceHistory, portfolio.portfolioRiskLevel || 50);
+    // --- עיבוד התוצאה ---
+    let stop_loss_percent = Number(result.stop_loss_percent) || 10;
+    let stop_loss_price = Number(result.stop_loss_price) || currentPrice * (1 - stop_loss_percent / 100);
 
     const clean = {
-      risk_score: result.riskScore,
-      stop_loss_price: result.stopLossPrice,
+      risk_score: Math.min(Math.max(Number(result.risk_score) || 5, 1), 10),
+      stop_loss_percent: +stop_loss_percent.toFixed(2),
+      stop_loss_price: +stop_loss_price.toFixed(2),
+      rationale: String(result.rationale || 'נוצר לפי מודל Base44').slice(0, 200)
     };
 
+    // --- שמירה במטמון ---
     userRiskCache[userId][ticker] = { price: currentPrice, result: clean };
 
+    log.info(`✅ חישוב ריסק על ידי AI עבור ${ticker} (${userId}) →`, clean);
     return clean;
-  } catch (err) {
-    log.error(`❌ שגיאה בחישוב סיכון למניה ${stockData.ticker}: ${err.message}`);
-    return null;
+
+  } catch (e) {
+    log.error(`❌ שגיאה בחישוב ריסק למניה ${stockData.ticker}: ${e.message}`);
+    // במקרה של תקלה, נחזיר חישוב דיפולטי
+    return {
+      risk_score: 5,
+      stop_loss_percent: 10,
+      stop_loss_price: +(stockData.currentPrice * 0.9).toFixed(2),
+      rationale: 'Fallback: חישוב דיפולטי עקב תקלה במודל AI'
+    };
   }
 }
 
