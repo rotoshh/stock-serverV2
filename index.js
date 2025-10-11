@@ -7,6 +7,7 @@ const fetch = require('node-fetch');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
 const { generateJSONFromHF } = require('./hfClient');
+const { calculateRiskAndStopLoss } = require('./riskCalculator');
 
 const log = console;
 const app = express();
@@ -125,51 +126,41 @@ setInterval(() => {
 }, 30000);
 
 // ====== FUNCTIONS ======
+
 async function calculateAdvancedRisk(stockData, userId) {
   try {
     const { ticker, currentPrice } = stockData;
     if (!userRiskCache[userId]) userRiskCache[userId] = {};
 
+    // בדיקת מטמון
     const cached = userRiskCache[userId][ticker];
     if (cached) {
       const changePercent = Math.abs(currentPrice - cached.price) / cached.price * 100;
-      if (changePercent < 5) return cached.result;
+      if (changePercent < 3) return cached.result;
     }
 
-    const prompt = PROMPT_TEMPLATE
-      .replace('{TICKER}', ticker)
-      .replace('{CURRENT_PRICE}', currentPrice)
-      .replace('{QUANTITY}', stockData.quantity)
-      .replace('{AMOUNT_INVESTED}', stockData.amountInvested)
-      .replace('{SECTOR}', stockData.sector || 'לא מוגדר');
+    const portfolio = userPortfolios[userId];
+    const priceHistory = [currentPrice * 0.98, currentPrice * 1.01, currentPrice * 0.99, currentPrice * 1.02, currentPrice]; // זמני — תוכל להחליף בהיסטוריה אמיתית בהמשך
 
-    const result = await generateJSONFromHF(prompt);
+    const stock = {
+      ticker,
+      entry_price: stockData.amountInvested || currentPrice,
+      sector: stockData.sector || 'לא ידוע',
+    };
 
-    let stop_loss_percent = Number(result.stop_loss_percent) || 10;
-    let stop_loss_price = Number(result.stop_loss_price) || currentPrice * (1 - stop_loss_percent / 100);
+    // כאן הקריאה למודל של Base44
+    const result = calculateRiskAndStopLoss(stock, priceHistory, portfolio.portfolioRiskLevel || 50);
 
     const clean = {
-      risk_score: Math.min(Math.max(Number(result.risk_score) || 5, 1), 10),
-      stop_loss_percent: +stop_loss_percent.toFixed(2),
-      stop_loss_price: +stop_loss_price.toFixed(2),
-      rationale: String(result.rationale || '').slice(0, 200)
+      risk_score: result.riskScore,
+      stop_loss_price: result.stopLossPrice,
     };
 
     userRiskCache[userId][ticker] = { price: currentPrice, result: clean };
 
-    const portfolio = userPortfolios[userId];
-    if (!shouldThrottle(userId, ticker, "STOP_LOSS_UPDATED", 5 * 60 * 1000)) {
-      await sendEmail(
-        portfolio.userEmail || process.env.ALERT_EMAIL,
-        `📊 Stop Loss Updated (${ticker})`,
-        `משתמש: ${userId}\nמניה: ${ticker}\nמחיר נוכחי: ${currentPrice}\nStop Loss חדש: ${clean.stop_loss_price}\nRisk: ${clean.risk_score}`
-      );
-      await notifyMake({ type: "STOP_LOSS_UPDATED", userId, symbol: ticker, ...clean });
-    }
-
     return clean;
-  } catch (e) {
-    log.error(`❌ שגיאה בחישוב ריסק למניה ${stockData.ticker}: ${e.message}`);
+  } catch (err) {
+    log.error(`❌ שגיאה בחישוב סיכון למניה ${stockData.ticker}: ${err.message}`);
     return null;
   }
 }
