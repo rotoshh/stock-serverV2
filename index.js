@@ -248,6 +248,88 @@ async function checkAndUpdatePrices() {
   }
 }
 
+/**
+ * stockRiskCalculator.js
+ * 
+ * מודול שמחשב סיכון וסטופ-לוס עבור מניות.
+ * ניתן לייבא לקובץ אחר (למשל לשרת Express) לשימוש ב-API.
+ */
+
+/**
+ * פונקציית דמה שמדמה היסטוריית מחירים עבור טיקר.
+ * (בפרודקשן — יש להחליף בקריאה אמיתית ל-API פיננסי)
+ */
+async function getSimulatedPriceHistory(ticker) {
+  console.log(`מדמה קבלת היסטוריית מחירים עבור ${ticker}...`);
+
+  const basePrice = 200;
+  let volatilityFactor = 0.02; // תנודתיות בסיסית (2%)
+
+  if (ticker.includes('TSLA') || ticker.includes('NVDA')) volatilityFactor = 0.045;
+  if (ticker.includes('AAPL') || ticker.includes('MSFT')) volatilityFactor = 0.015;
+  if (ticker.includes('BTC')) volatilityFactor = 0.08;
+
+  const prices = [];
+  for (let i = 0; i < 90; i++) {
+    const randomChange = (Math.random() - 0.5) * 2 * volatilityFactor;
+    const price = basePrice * (1 + randomChange * (i / 90));
+    prices.push(price);
+  }
+
+  return prices;
+}
+
+/**
+ * מחשב רמת סיכון וסטופ-לוס עבור מניה נתונה.
+ * 
+ * @param {Object} stock - פרטי המניה (ticker, entry_price, sector)
+ * @param {Array<number>} priceHistory - מערך של מחירים היסטוריים
+ * @param {string|number} portfolioRiskLevel - רמת הסיכון הכוללת של התיק (למשל: "low" / "medium" / "high")
+ * @returns {Object} { riskScore, stopLossPrice }
+ */
+function calculateRiskAndStopLoss(stock, priceHistory, portfolioRiskLevel) {
+  if (!priceHistory || priceHistory.length < 2) {
+    throw new Error('Price history is missing or insufficient.');
+  }
+
+  // חישוב סטיית תקן (מדד תנודתיות)
+  const avg = priceHistory.reduce((a, b) => a + b, 0) / priceHistory.length;
+  const variance = priceHistory.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / priceHistory.length;
+  const volatility = Math.sqrt(variance) / avg;
+
+  // קביעת רמת סיכון בסיסית לפי תנודתיות
+  let riskScore = volatility * 100; // אחוזים
+
+  // התאמות לפי סקטור
+  if (stock.sector) {
+    if (stock.sector.toLowerCase().includes('tech')) riskScore *= 1.2;
+    if (stock.sector.toLowerCase().includes('energy')) riskScore *= 1.1;
+    if (stock.sector.toLowerCase().includes('financial')) riskScore *= 0.9;
+  }
+
+  // התאמות לפי רמת סיכון כוללת של התיק
+  if (portfolioRiskLevel === 'low') riskScore *= 0.9;
+  if (portfolioRiskLevel === 'high') riskScore *= 1.15;
+
+  // הגבלת ערכים קיצוניים
+  riskScore = Math.min(Math.max(riskScore, 5), 100);
+
+  // חישוב מחיר סטופ לוס
+  const stopLossPercent = Math.min(riskScore / 100 * 0.5, 0.15); // עד 15% מהמחיר
+  const stopLossPrice = stock.entry_price * (1 - stopLossPercent);
+
+  return {
+    ticker: stock.ticker,
+    riskScore: Number(riskScore.toFixed(2)),
+    stopLossPrice: Number(stopLossPrice.toFixed(2))
+  };
+}
+
+module.exports = {
+  getSimulatedPriceHistory,
+  calculateRiskAndStopLoss
+};
+
 // ====== ROUTES ======
 app.get('/', (req, res) => res.send('✅ RiskWise API Online'));
 
