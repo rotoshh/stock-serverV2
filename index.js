@@ -4,8 +4,8 @@ const cors = require('cors');
 const cron = require('node-cron');
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
-const { generateJSONFromHF } = require('./hfClient');
-const { sendEmail } = require('./emailService'); // ✅ מערכת מיילים קיימת
+const { sendEmail } = require('./emailService');
+const { calculateRiskAndStopLoss } = require('./riskCalculator'); // ✅ שימוש במודל Base44 החדש
 
 const log = console;
 const app = express();
@@ -31,25 +31,7 @@ app.use(express.json({ limit: '1mb' }));
 const userPortfolios = {};
 const userPrices = {};
 const priceHistory15Min = {};
-const userRiskCache = {};
 const sseClients = {}; // לקוחות SSE
-
-// ====== PROMPT TEMPLATE ======
-const PROMPT_TEMPLATE = `
-אתה מנוע סיכון כמותי. החזר JSON חוקי בלבד.
-{
-  "risk_score": number,
-  "stop_loss_percent": number,
-  "stop_loss_price": number,
-  "rationale": string
-}
-נתוני המניה:
-- טיקר: {TICKER}
-- מחיר נוכחי: {CURRENT_PRICE}
-- כמות: {QUANTITY}
-- סכום מושקע: {AMOUNT_INVESTED}
-- סקטור: {SECTOR}
-`;
 
 // ====== SSE HELPERS ======
 function pushUpdate(userId, data) {
@@ -70,62 +52,44 @@ setInterval(() => {
   }
 }, 30000);
 
-// ====== פונקציית חישוב ריסק וסטופ לוס ======
-async function calculateAdvancedRisk(stockData, userId) {
+// ====== חישוב סיכון וסטופ לוס בעזרת Base44 ======
+async function calculateRiskBase44(stockData, portfolioRiskLevel = 50) {
   try {
-    const { ticker, currentPrice } = stockData;
-    if (!userRiskCache[userId]) userRiskCache[userId] = {};
+    const { ticker, currentPrice, sector } = stockData;
 
-    const cached = userRiskCache[userId][ticker];
-    if (cached) {
-      const changePercent = Math.abs(currentPrice - cached.price) / cached.price * 100;
-      if (changePercent < 5) {
-        log.info(`⚡ שימוש בנתוני מטמון לריסק ${ticker} עבור ${userId}`);
-        return cached.result;
-      }
+    // שלב 1: הדמיית היסטוריית מחירים (או שימוש אמיתי בעתיד)
+    const priceHistory = [];
+    for (let i = 0; i < 60; i++) {
+      const change = (Math.random() - 0.5) * 0.05;
+      const price = currentPrice * (1 + change);
+      priceHistory.push(price);
     }
 
-    const prompt = PROMPT_TEMPLATE
-      .replace('{TICKER}', ticker)
-      .replace('{CURRENT_PRICE}', currentPrice)
-      .replace('{QUANTITY}', stockData.quantity)
-      .replace('{AMOUNT_INVESTED}', stockData.amountInvested)
-      .replace('{SECTOR}', stockData.sector || 'לא מוגדר');
+    // שלב 2: חישוב לפי המודל של Base44
+    const result = calculateRiskAndStopLoss({
+      ticker,
+      entry_price: currentPrice,
+      sector: sector || 'לא מוגדר'
+    }, priceHistory, portfolioRiskLevel);
 
-    const result = await generateJSONFromHF(prompt);
-
-    let stop_loss_percent = Number(result.stop_loss_percent) || 10;
-    let stop_loss_price = Number(result.stop_loss_price) || currentPrice * (1 - stop_loss_percent / 100);
-
-    const clean = {
-      risk_score: Math.min(Math.max(Number(result.risk_score) || 5, 1), 10),
-      stop_loss_percent: +stop_loss_percent.toFixed(2),
-      stop_loss_price: +stop_loss_price.toFixed(2),
-      rationale: String(result.rationale || '').slice(0, 200)
-    };
-
-    userRiskCache[userId][ticker] = { price: currentPrice, result: clean };
-    log.info(`✅ חישוב ריסק עבור ${ticker} (${userId}) →`, clean);
-
-    return clean;
+    return result;
   } catch (e) {
-    log.error(`❌ שגיאה בחישוב ריסק למניה ${stockData.ticker}: ${e.message}`);
+    log.error(`❌ שגיאה בחישוב ריסק Base44: ${e.message}`);
     return null;
   }
 }
 
-// ====== עדכון סטופ לוס ושליחת מיילים ======
+// ====== עדכון סטופ לוס ושליחת מייל ======
 async function updateStopLossAndNotify(userId, symbol, portfolio, riskData, currentPrice) {
   const oldStopLoss = portfolio.stocks[symbol].stopLoss || 0;
-  const newStopLoss = riskData.stop_loss_price;
-
+  const newStopLoss = riskData.stopLossPrice;
   if (Math.abs(newStopLoss - oldStopLoss) > 0.01) {
     portfolio.stocks[symbol].stopLoss = newStopLoss;
     const msg = `
       <h2>📉 עדכון סטופ לוס</h2>
       <p>המניה <strong>${symbol}</strong> עודכנה על ידי מערכת הסיכון.</p>
       <p>סטופ לוס חדש: <strong>$${newStopLoss.toFixed(2)}</strong></p>
-      <p>רמת סיכון: ${riskData.risk_score}</p>
+      <p>רמת סיכון: ${riskData.riskScore}</p>
     `;
     await sendEmail({
       to: portfolio.userEmail,
@@ -146,12 +110,10 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
     const change = ((currentPrice - history.price) / history.price) * 100;
     if (change <= -5) {
       log.warn(`📉 ירידה ${change.toFixed(2)}% ב-15 דק' עבור ${symbol} (${userId})`);
-      const riskResult = await calculateAdvancedRisk({
+      const riskResult = await calculateRiskBase44({
         ticker: symbol, currentPrice,
-        quantity: portfolio.stocks[symbol].quantity || 1,
-        amountInvested: portfolio.stocks[symbol].amountInvested || currentPrice,
-        sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
-      }, userId);
+        sector: portfolio.stocks[symbol].sector
+      }, portfolio.portfolioRiskLevel);
       if (riskResult) {
         await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, currentPrice);
       }
@@ -160,41 +122,33 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
   priceHistory15Min[userId][symbol] = { price: currentPrice, time: now };
 }
 
-// ====== בדיקת מחירים וחישוב סיכון ======
+// ====== בדיקת מחירים ======
 async function checkAndUpdatePrices() {
   for (const userId in userPortfolios) {
     const portfolio = userPortfolios[userId];
-    if (!userPrices[userId]) userPrices[userId] = {};
-
     for (const symbol in portfolio.stocks) {
       try {
-        let price = portfolio.alpacaKeys
+        const price = portfolio.alpacaKeys
           ? await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret)
           : await getFinnhubPrice(symbol);
 
-        userPrices[userId][symbol] = { price, time: Date.now() };
-
-        const riskResult = await calculateAdvancedRisk({
+        const riskResult = await calculateRiskBase44({
           ticker: symbol,
           currentPrice: price,
-          quantity: portfolio.stocks[symbol].quantity || 1,
-          amountInvested: portfolio.stocks[symbol].amountInvested || price,
-          sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
-        }, userId);
+          sector: portfolio.stocks[symbol].sector
+        }, portfolio.portfolioRiskLevel);
 
         if (riskResult) {
-          portfolio.stocks[symbol].stopLoss = riskResult.stop_loss_price;
-          portfolio.stocks[symbol].risk = riskResult.risk_score;
+          portfolio.stocks[symbol].stopLoss = riskResult.stopLossPrice;
+          portfolio.stocks[symbol].risk = riskResult.riskScore;
           await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, price);
         }
-
-        await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
 
         pushUpdate(userId, {
           stockTicker: symbol,
           price,
-          stopLoss: portfolio.stocks[symbol].stopLoss || null,
-          risk: portfolio.stocks[symbol].risk || null
+          stopLoss: portfolio.stocks[symbol].stopLoss,
+          risk: portfolio.stocks[symbol].risk
         });
 
         log.info(`📊 ${symbol} (${userId}) → $${price} | SL: ${portfolio.stocks[symbol].stopLoss}`);
@@ -206,48 +160,25 @@ async function checkAndUpdatePrices() {
 }
 
 // ====== ROUTES ======
-app.get('/', (req, res) => res.send('✅ RiskWise API Online'));
+app.get('/', (req, res) => res.send('✅ RiskWise API (Base44 model) Online'));
 
 app.post('/update-portfolio', (req, res) => {
-  log.info("📥 התקבלה בקשת עדכון תיק:", req.body);
   const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
-
-  if (!userId || !stocks) {
-    log.error("❌ בקשה חסרה נתונים:", req.body);
-    return res.status(400).json({ error: 'חסרים נתונים' });
-  }
-
+  if (!userId || !stocks) return res.status(400).json({ error: 'חסרים נתונים' });
   userPortfolios[userId] = { stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment };
-  log.info(`📁 תיק נשמר בהצלחה עבור ${userId}`);
   res.json({ message: 'Portfolio updated' });
-});
-
-app.get('/portfolio/:userId', (req, res) => {
-  const userId = req.params.userId;
-  log.info(`🔍 בקשת שליפת תיק עבור ${userId}`);
-  const portfolio = userPortfolios[userId];
-  if (!portfolio) {
-    log.error(`❌ לא נמצא תיק עבור ${userId}`);
-    return res.status(404).json({ error: 'Not found' });
-  }
-  res.json(portfolio);
 });
 
 // 🔴 SSE
 app.get('/events/:userId', (req, res) => {
   const userId = req.params.userId;
-  log.info(`📡 חיבור SSE נפתח עבור ${userId}`);
-
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
-
   if (!sseClients[userId]) sseClients[userId] = [];
   sseClients[userId].push(res);
-
   req.on('close', () => {
-    log.warn(`❌ חיבור SSE נסגר עבור ${userId}`);
     sseClients[userId] = sseClients[userId].filter(r => r !== res);
   });
 });
@@ -258,4 +189,4 @@ app.listen(PORT, () => {
   log.info(`✅ Server started on port ${PORT}`);
   setInterval(checkAndUpdatePrices, 60 * 1000); // כל דקה
 });
-cron.schedule('0 14 * * 5', checkAndUpdatePrices); // כל יום שישי
+cron.schedule('0 14 * * 5', checkAndUpdatePrices);
