@@ -2,14 +2,10 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
-const nodemailer = require('nodemailer');
-const fetch = require('node-fetch'); // או השתמשnative fetch ב-Node אם מותקנת
-const axios = require('axios');
-
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
-// חשוב: base44Client.js צריך לייצא את הפונקציות האלו
-const { generateJSONFromBase44, calculateRiskAndStopLoss } = require('./base44Client');
+const { generateJSONFromHF } = require('./hfClient');
+const { sendEmail } = require('./emailService'); // ✅ מערכת מיילים קיימת
 
 const log = console;
 const app = express();
@@ -37,36 +33,8 @@ const userPrices = {};
 const priceHistory15Min = {};
 const userRiskCache = {};
 const sseClients = {}; // לקוחות SSE
-const lastAlerts = {}; // למניעת הצפה
 
-// ====== HELPERS: throttling / MAKE notifier / email ======
-function alertKey(userId, symbol, type) {
-  return `${userId}:${symbol}:${type}`;
-}
-function shouldThrottle(userId, symbol, type, windowMs = 10 * 60 * 1000) {
-  const k = alertKey(userId, symbol, type);
-  const now = Date.now();
-  if (!lastAlerts[k] || (now - lastAlerts[k]) > windowMs) {
-    lastAlerts[k] = now;
-    return false;
-  }
-  return true;
-}
-async function notifyMake(event) {
-  try {
-    if (!process.env.MAKE_WEBHOOK_URL) return;
-    const res = await fetch(process.env.MAKE_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...event, ts: new Date().toISOString() })
-    });
-    log.info(`📤 נשלחה התראה ל-Make (${event.type}) → ${res.status}`);
-  } catch (err) {
-    log.error("❌ שגיאה בשליחת התראה ל-Make:", err.message);
-  }
-}
-
-// ====== PROMPT TEMPLATE (אם תצטרך לשלוח לפרומפט ישירות) ======
+// ====== PROMPT TEMPLATE ======
 const PROMPT_TEMPLATE = `
 אתה מנוע סיכון כמותי. החזר JSON חוקי בלבד.
 {
@@ -87,33 +55,27 @@ const PROMPT_TEMPLATE = `
 function pushUpdate(userId, data) {
   if (sseClients[userId]) {
     sseClients[userId].forEach(res => {
-      try {
-        res.write(`data: ${JSON.stringify(data)}\n\n`);
-      } catch (e) {
-        log.warn('⚠️ שגיאה בכתיבה ל-SSE client:', e.message);
-      }
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
     });
     log.info(`📡 נשלח עדכון SSE ל-${userId}:`, data);
   }
 }
+
 // שמירה על חיבור SSE חי (ping כל 30 שניות)
 setInterval(() => {
   for (const userId in sseClients) {
     sseClients[userId].forEach(res => {
-      try {
-        res.write(`data: ${JSON.stringify({ type: "ping", ts: Date.now() })}\n\n`);
-      } catch (e) {
-        // ignore
-      }
+      res.write(`data: ${JSON.stringify({ type: "ping", ts: Date.now() })}\n\n`);
     });
   }
 }, 30000);
 
-// ====== CORE FUNCTIONS ======
+// ====== פונקציית חישוב ריסק וסטופ לוס ======
 async function calculateAdvancedRisk(stockData, userId) {
   try {
     const { ticker, currentPrice } = stockData;
     if (!userRiskCache[userId]) userRiskCache[userId] = {};
+
     const cached = userRiskCache[userId][ticker];
     if (cached) {
       const changePercent = Math.abs(currentPrice - cached.price) / cached.price * 100;
@@ -123,28 +85,14 @@ async function calculateAdvancedRisk(stockData, userId) {
       }
     }
 
-    // אם יש לך פונקציה ב-base44Client שמקבלת prompt / נתונים:
-    // העדיפות היא להשתמש ב-calculateRiskAndStopLoss אם היא קיימת
-    let result;
-    if (typeof calculateRiskAndStopLoss === 'function') {
-      result = await calculateRiskAndStopLoss({
-        ticker,
-        currentPrice,
-        quantity: stockData.quantity,
-        amountInvested: stockData.amountInvested,
-        sector: stockData.sector
-      });
-    } else {
-      // fallback: שלח פרומפט גולמי
-      const prompt = PROMPT_TEMPLATE
-        .replace('{TICKER}', ticker)
-        .replace('{CURRENT_PRICE}', currentPrice)
-        .replace('{QUANTITY}', stockData.quantity)
-        .replace('{AMOUNT_INVESTED}', stockData.amountInvested)
-        .replace('{SECTOR}', stockData.sector || 'לא מוגדר');
+    const prompt = PROMPT_TEMPLATE
+      .replace('{TICKER}', ticker)
+      .replace('{CURRENT_PRICE}', currentPrice)
+      .replace('{QUANTITY}', stockData.quantity)
+      .replace('{AMOUNT_INVESTED}', stockData.amountInvested)
+      .replace('{SECTOR}', stockData.sector || 'לא מוגדר');
 
-      result = await generateJSONFromBase44(prompt); // פונקציה מ־base44Client
-    }
+    const result = await generateJSONFromHF(prompt);
 
     let stop_loss_percent = Number(result.stop_loss_percent) || 10;
     let stop_loss_price = Number(result.stop_loss_price) || currentPrice * (1 - stop_loss_percent / 100);
@@ -156,8 +104,9 @@ async function calculateAdvancedRisk(stockData, userId) {
       rationale: String(result.rationale || '').slice(0, 200)
     };
 
-    userRiskCache[userId][ticker] = { price: currentPrice, result: clean, timestamp: Date.now() };
+    userRiskCache[userId][ticker] = { price: currentPrice, result: clean };
     log.info(`✅ חישוב ריסק עבור ${ticker} (${userId}) →`, clean);
+
     return clean;
   } catch (e) {
     log.error(`❌ שגיאה בחישוב ריסק למניה ${stockData.ticker}: ${e.message}`);
@@ -165,6 +114,29 @@ async function calculateAdvancedRisk(stockData, userId) {
   }
 }
 
+// ====== עדכון סטופ לוס ושליחת מיילים ======
+async function updateStopLossAndNotify(userId, symbol, portfolio, riskData, currentPrice) {
+  const oldStopLoss = portfolio.stocks[symbol].stopLoss || 0;
+  const newStopLoss = riskData.stop_loss_price;
+
+  if (Math.abs(newStopLoss - oldStopLoss) > 0.01) {
+    portfolio.stocks[symbol].stopLoss = newStopLoss;
+    const msg = `
+      <h2>📉 עדכון סטופ לוס</h2>
+      <p>המניה <strong>${symbol}</strong> עודכנה על ידי מערכת הסיכון.</p>
+      <p>סטופ לוס חדש: <strong>$${newStopLoss.toFixed(2)}</strong></p>
+      <p>רמת סיכון: ${riskData.risk_score}</p>
+    `;
+    await sendEmail({
+      to: portfolio.userEmail,
+      subject: `עדכון סטופ לוס - ${symbol}`,
+      html: msg
+    });
+    log.info(`📧 נשלח מייל עדכון סטופ לוס עבור ${symbol} (${userId})`);
+  }
+}
+
+// ====== בדיקה של ירידה של 5% ב-15 דקות ======
 async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
   if (!priceHistory15Min[userId]) priceHistory15Min[userId] = {};
   const now = Date.now();
@@ -174,28 +146,21 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
     const change = ((currentPrice - history.price) / history.price) * 100;
     if (change <= -5) {
       log.warn(`📉 ירידה ${change.toFixed(2)}% ב-15 דק' עבור ${symbol} (${userId})`);
-      if (!shouldThrottle(userId, symbol, "FIFTEEN_MIN_DROP", 10 * 60 * 1000)) {
-        await notifyMake({ type: "FIFTEEN_MIN_DROP", userId, symbol, price: currentPrice, changePercent: change.toFixed(2) });
-      }
-
       const riskResult = await calculateAdvancedRisk({
-        ticker: symbol,
-        currentPrice,
+        ticker: symbol, currentPrice,
         quantity: portfolio.stocks[symbol].quantity || 1,
         amountInvested: portfolio.stocks[symbol].amountInvested || currentPrice,
         sector: portfolio.stocks[symbol].sector || 'לא מוגדר'
       }, userId);
-
       if (riskResult) {
-        portfolio.stocks[symbol].stopLoss = riskResult.stop_loss_price;
-        portfolio.stocks[symbol].risk = riskResult.risk_score;
+        await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, currentPrice);
       }
     }
   }
-
   priceHistory15Min[userId][symbol] = { price: currentPrice, time: now };
 }
 
+// ====== בדיקת מחירים וחישוב סיכון ======
 async function checkAndUpdatePrices() {
   for (const userId in userPortfolios) {
     const portfolio = userPortfolios[userId];
@@ -203,13 +168,12 @@ async function checkAndUpdatePrices() {
 
     for (const symbol in portfolio.stocks) {
       try {
-        const price = portfolio.alpacaKeys
+        let price = portfolio.alpacaKeys
           ? await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret)
           : await getFinnhubPrice(symbol);
 
         userPrices[userId][symbol] = { price, time: Date.now() };
 
-        // חישוב ריסק/סטופ־לוס
         const riskResult = await calculateAdvancedRisk({
           ticker: symbol,
           currentPrice: price,
@@ -221,18 +185,11 @@ async function checkAndUpdatePrices() {
         if (riskResult) {
           portfolio.stocks[symbol].stopLoss = riskResult.stop_loss_price;
           portfolio.stocks[symbol].risk = riskResult.risk_score;
-        }
-
-        // בדיקת סטופ־לוס
-        if (portfolio.stocks[symbol].stopLoss && price <= portfolio.stocks[symbol].stopLoss) {
-          if (!shouldThrottle(userId, symbol, "STOP_LOSS_HIT", 60 * 1000)) {
-            await notifyMake({ type: "STOP_LOSS_HIT", userId, symbol, price, stopLoss: portfolio.stocks[symbol].stopLoss });
-          }
+          await updateStopLossAndNotify(userId, symbol, portfolio, riskResult, price);
         }
 
         await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
 
-        // שליחה ל־frontend
         pushUpdate(userId, {
           stockTicker: symbol,
           price,
@@ -242,93 +199,11 @@ async function checkAndUpdatePrices() {
 
         log.info(`📊 ${symbol} (${userId}) → $${price} | SL: ${portfolio.stocks[symbol].stopLoss}`);
       } catch (err) {
-        log.error(`❌ שגיאה בעדכון מחיר עבור ${symbol}: ${err.message}`);
+        log.error(`❌ שגיאה במחיר ${symbol}: ${err.message}`);
       }
     }
   }
 }
-
-/**
- * stockRiskCalculator.js
- * 
- * מודול שמחשב סיכון וסטופ-לוס עבור מניות.
- * ניתן לייבא לקובץ אחר (למשל לשרת Express) לשימוש ב-API.
- */
-
-/**
- * פונקציית דמה שמדמה היסטוריית מחירים עבור טיקר.
- * (בפרודקשן — יש להחליף בקריאה אמיתית ל-API פיננסי)
- */
-async function getSimulatedPriceHistory(ticker) {
-  console.log(`מדמה קבלת היסטוריית מחירים עבור ${ticker}...`);
-
-  const basePrice = 200;
-  let volatilityFactor = 0.02; // תנודתיות בסיסית (2%)
-
-  if (ticker.includes('TSLA') || ticker.includes('NVDA')) volatilityFactor = 0.045;
-  if (ticker.includes('AAPL') || ticker.includes('MSFT')) volatilityFactor = 0.015;
-  if (ticker.includes('BTC')) volatilityFactor = 0.08;
-
-  const prices = [];
-  for (let i = 0; i < 90; i++) {
-    const randomChange = (Math.random() - 0.5) * 2 * volatilityFactor;
-    const price = basePrice * (1 + randomChange * (i / 90));
-    prices.push(price);
-  }
-
-  return prices;
-}
-
-/**
- * מחשב רמת סיכון וסטופ-לוס עבור מניה נתונה.
- * 
- * @param {Object} stock - פרטי המניה (ticker, entry_price, sector)
- * @param {Array<number>} priceHistory - מערך של מחירים היסטוריים
- * @param {string|number} portfolioRiskLevel - רמת הסיכון הכוללת של התיק (למשל: "low" / "medium" / "high")
- * @returns {Object} { riskScore, stopLossPrice }
- */
-function calculateRiskAndStopLoss(stock, priceHistory, portfolioRiskLevel) {
-  if (!priceHistory || priceHistory.length < 2) {
-    throw new Error('Price history is missing or insufficient.');
-  }
-
-  // חישוב סטיית תקן (מדד תנודתיות)
-  const avg = priceHistory.reduce((a, b) => a + b, 0) / priceHistory.length;
-  const variance = priceHistory.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / priceHistory.length;
-  const volatility = Math.sqrt(variance) / avg;
-
-  // קביעת רמת סיכון בסיסית לפי תנודתיות
-  let riskScore = volatility * 100; // אחוזים
-
-  // התאמות לפי סקטור
-  if (stock.sector) {
-    if (stock.sector.toLowerCase().includes('tech')) riskScore *= 1.2;
-    if (stock.sector.toLowerCase().includes('energy')) riskScore *= 1.1;
-    if (stock.sector.toLowerCase().includes('financial')) riskScore *= 0.9;
-  }
-
-  // התאמות לפי רמת סיכון כוללת של התיק
-  if (portfolioRiskLevel === 'low') riskScore *= 0.9;
-  if (portfolioRiskLevel === 'high') riskScore *= 1.15;
-
-  // הגבלת ערכים קיצוניים
-  riskScore = Math.min(Math.max(riskScore, 5), 100);
-
-  // חישוב מחיר סטופ לוס
-  const stopLossPercent = Math.min(riskScore / 100 * 0.5, 0.15); // עד 15% מהמחיר
-  const stopLossPrice = stock.entry_price * (1 - stopLossPercent);
-
-  return {
-    ticker: stock.ticker,
-    riskScore: Number(riskScore.toFixed(2)),
-    stopLossPrice: Number(stopLossPrice.toFixed(2))
-  };
-}
-
-module.exports = {
-  getSimulatedPriceHistory,
-  calculateRiskAndStopLoss
-};
 
 // ====== ROUTES ======
 app.get('/', (req, res) => res.send('✅ RiskWise API Online'));
@@ -358,7 +233,7 @@ app.get('/portfolio/:userId', (req, res) => {
   res.json(portfolio);
 });
 
-// 🔴 חיבור SSE
+// 🔴 SSE
 app.get('/events/:userId', (req, res) => {
   const userId = req.params.userId;
   log.info(`📡 חיבור SSE נפתח עבור ${userId}`);
