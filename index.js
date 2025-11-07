@@ -1,5 +1,5 @@
 // ===========================================
-// index.js – RiskWise AI Server (Push + Event Polling from Finnhub, No Base44)
+// index.js – RiskWise AI Server (Push + Event Polling + Finnhub WS)
 // ===========================================
 require('dotenv').config();
 const express = require('express');
@@ -7,6 +7,7 @@ const cors = require('cors');
 const cron = require('node-cron');
 const axios = require('axios');
 const dayjs = require('dayjs');
+const WebSocket = require('ws');
 
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
@@ -45,6 +46,62 @@ const sseClients = {};          // userId -> [res, ...]
 const userPushSubs = {};        // userId -> pushSubscription
 const seenFinnhubEvents = {};   // ticker -> { eventId: timestamp } to avoid duplicate notifications
 
+// ====== Real-time price streaming via Finnhub WebSocket ======
+let finnhubSocket = null;
+let subscribedTickers = new Set();
+
+function connectFinnhubStream() {
+  if (!FINNHUB_KEY) return log.warn('⚠️ No FINNHUB_API_KEY — skipping live price stream');
+  
+  finnhubSocket = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_KEY}`);
+
+  finnhubSocket.on('open', () => {
+    log.info('📡 Connected to Finnhub live price stream');
+    for (const symbol of subscribedTickers) {
+      finnhubSocket.send(JSON.stringify({ type: 'subscribe', symbol }));
+    }
+  });
+
+  finnhubSocket.on('message', (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      if (data.type === 'trade' && data.data) {
+        data.data.forEach(t => {
+          const { s: symbol, p: price } = t;
+          for (const userId in userPortfolios) {
+            const portfolio = userPortfolios[userId];
+            if (portfolio.stocks && portfolio.stocks[symbol]) {
+              portfolio.stocks[symbol].lastPrice = price;
+              pushUpdate(userId, { type: 'price', symbol, price });
+            }
+          }
+        });
+      }
+    } catch (err) {
+      log.error('⚠️ Finnhub stream parse error', err.message);
+    }
+  });
+
+  finnhubSocket.on('close', () => {
+    log.warn('🔌 Finnhub WebSocket closed — reconnecting in 10s...');
+    setTimeout(connectFinnhubStream, 10_000);
+  });
+
+  finnhubSocket.on('error', (err) => {
+    log.error('❌ Finnhub WS error:', err.message);
+  });
+}
+
+function subscribeToLiveTicker(symbol) {
+  if (!symbol || !FINNHUB_KEY) return;
+  subscribedTickers.add(symbol);
+  if (finnhubSocket && finnhubSocket.readyState === WebSocket.OPEN) {
+    finnhubSocket.send(JSON.stringify({ type: 'subscribe', symbol }));
+  }
+}
+
+connectFinnhubStream();
+
 // ====== SSE HELPERS ======
 function pushUpdate(userId, data) {
   if (sseClients[userId]) {
@@ -68,11 +125,8 @@ setInterval(() => {
 async function calculateFullRisk(userId, symbol, currentPrice, portfolio) {
   try {
     const analysis = await analyzeStockRisk(symbol, currentPrice);
-
-    // normalize field names (support analyzeStockRisk returning riskScore or overallRiskScore)
     const overallRiskScore = analysis?.overallRiskScore ?? analysis?.riskScore ?? null;
 
-    // update portfolio state
     portfolio.stocks[symbol].overallRisk = overallRiskScore;
     portfolio.stocks[symbol].beta = analysis.beta ?? portfolio.stocks[symbol].beta;
     portfolio.stocks[symbol].volatility = analysis.volatility ?? portfolio.stocks[symbol].volatility;
@@ -80,7 +134,6 @@ async function calculateFullRisk(userId, symbol, currentPrice, portfolio) {
     portfolio.stocks[symbol].earningsImpact = analysis.earningsImpact ?? portfolio.stocks[symbol].earningsImpact;
     portfolio.stocks[symbol].analysis = analysis;
 
-    // SSE
     pushUpdate(userId, {
       type: 'risk-update',
       symbol,
@@ -100,7 +153,6 @@ async function calculateFullRisk(userId, symbol, currentPrice, portfolio) {
 async function updateStopLossAndNotify(userId, symbol, portfolio, currentPrice, overallRiskScore) {
   try {
     const oldStopLoss = portfolio.stocks[symbol].stopLoss || 0;
-    // Example rule: stopLoss = currentPrice * (1 - overallRiskScore/100) — you can change this formula
     const newStopLoss = Number((currentPrice * (1 - (overallRiskScore / 100))).toFixed(2));
 
     if (Math.abs(newStopLoss - oldStopLoss) > 0.01) {
@@ -113,7 +165,6 @@ async function updateStopLossAndNotify(userId, symbol, portfolio, currentPrice, 
         <p>רמת סיכון: ${overallRiskScore}</p>
       `;
 
-      // send email
       if (portfolio.userEmail) {
         try {
           await sendEmail({ to: portfolio.userEmail, subject: `עדכון סטופ לוס - ${symbol}`, html: msg });
@@ -123,10 +174,8 @@ async function updateStopLossAndNotify(userId, symbol, portfolio, currentPrice, 
         }
       }
 
-      // SSE alert
       pushUpdate(userId, { type: 'stoploss-updated', symbol, newStopLoss, risk: overallRiskScore });
 
-      // push notification
       if (userPushSubs[userId]) {
         try {
           await sendPushNotification(userPushSubs[userId], {
@@ -155,14 +204,9 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
     const change = ((currentPrice - history.price) / history.price) * 100;
     if (change <= -5) {
       log.warn(`📉 ירידה ${change.toFixed(2)}% ב-15 דק' עבור ${symbol} (${userId})`);
-
-      // recalc risk
       const res = await calculateFullRisk(userId, symbol, currentPrice, portfolio);
-      if (res) {
-        await updateStopLossAndNotify(userId, symbol, portfolio, currentPrice, res.overallRiskScore);
-      }
+      if (res) await updateStopLossAndNotify(userId, symbol, portfolio, currentPrice, res.overallRiskScore);
 
-      // push alert
       if (userPushSubs[userId]) {
         try {
           await sendPushNotification(userPushSubs[userId], {
@@ -176,7 +220,6 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
         }
       }
 
-      // SSE already sent by calculateFullRisk
       pushUpdate(userId, { type: '15min-drop', symbol, changePercent: change, price: currentPrice });
     }
   }
@@ -193,18 +236,11 @@ async function checkAndUpdatePrices() {
           ? await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret)
           : await getFinnhubPrice(symbol);
 
-        // quick SSE price update
         pushUpdate(userId, { type: 'price', symbol, price });
-
-        // check 15min drop and react
         await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
 
-        // calculate advanced risk and update stoploss
         const res = await calculateFullRisk(userId, symbol, price, portfolio);
-        if (res) {
-          await updateStopLossAndNotify(userId, symbol, portfolio, price, res.overallRiskScore);
-        }
-
+        if (res) await updateStopLossAndNotify(userId, symbol, portfolio, price, res.overallRiskScore);
       } catch (err) {
         log.error(`❌ שגיאה בעדכון ${symbol} (${userId}): ${err.message}`);
       }
@@ -212,165 +248,93 @@ async function checkAndUpdatePrices() {
   }
 }
 
-// ====== Finnhub event polling: news + earnings ======
-
-// helper: fetch company news for a ticker between dates (Finnhub API)
+// ====== Finnhub event polling (news + earnings) ======
 async function fetchCompanyNews(symbol, fromISO, toISO) {
   if (!FINNHUB_KEY) return [];
   try {
-    const url = `https://finnhub.io/api/v1/company-news`;
-    const res = await axios.get(url, { params: { symbol, from: fromISO, to: toISO, token: FINNHUB_KEY }, timeout: 10000 });
+    const res = await axios.get(`https://finnhub.io/api/v1/company-news`, { params: { symbol, from: fromISO, to: toISO, token: FINNHUB_KEY }, timeout: 10000 });
     return res.data || [];
-  } catch (err) {
-    log.error('fetchCompanyNews error', symbol, err.message);
-    return [];
-  }
+  } catch (err) { log.error('fetchCompanyNews error', symbol, err.message); return []; }
 }
 
-// helper: fetch earnings (latest) — Finnhub /stock/earnings
 async function fetchEarnings(symbol) {
   if (!FINNHUB_KEY) return [];
   try {
-    const url = `https://finnhub.io/api/v1/stock/earnings`;
-    const res = await axios.get(url, { params: { symbol, token: FINNHUB_KEY }, timeout: 10000 });
+    const res = await axios.get(`https://finnhub.io/api/v1/stock/earnings`, { params: { symbol, token: FINNHUB_KEY }, timeout: 10000 });
     return res.data || [];
-  } catch (err) {
-    log.error('fetchEarnings error', symbol, err.message);
-    return [];
-  }
+  } catch (err) { log.error('fetchEarnings error', symbol, err.message); return []; }
 }
 
-// Event handling: when we detect new event -> recalc + push + email/push to affected users
 async function handleEventForTicker(symbol, event) {
-  // generate a stable event id (use url / datetime / category)
   const eventId = event.id || event.gid || `${symbol}::${event.headline || event.category || event.datetime || event.date || Math.random()}`;
   const now = Date.now();
   seenFinnhubEvents[symbol] = seenFinnhubEvents[symbol] || {};
-
-  // dedupe: ignore if seen recently (24h)
-  if (seenFinnhubEvents[symbol][eventId] && (now - seenFinnhubEvents[symbol][eventId] < 24 * 60 * 60 * 1000)) {
-    return;
-  }
+  if (seenFinnhubEvents[symbol][eventId] && (now - seenFinnhubEvents[symbol][eventId] < 24*60*60*1000)) return;
   seenFinnhubEvents[symbol][eventId] = now;
 
   log.info(`🛰️ אירוע חדש ל-${symbol}:`, event.headline || event.summary || event.type || event);
 
-  // notify all users who have this ticker in portfolio
   for (const userId in userPortfolios) {
     const p = userPortfolios[userId];
     if (!p.stocks || !p.stocks[symbol]) continue;
-
     try {
-      // get current price
-      const price = p.alpacaKeys
-        ? await getAlpacaPrice(symbol, p.alpacaKeys.key, p.alpacaKeys.secret)
-        : await getFinnhubPrice(symbol);
-
-      // recompute risk
+      const price = p.alpacaKeys ? await getAlpacaPrice(symbol, p.alpacaKeys.key, p.alpacaKeys.secret) : await getFinnhubPrice(symbol);
       const res = await calculateFullRisk(userId, symbol, price, p);
-      if (res) {
-        // send push about event
-        if (userPushSubs[userId]) {
-          try {
-            await sendPushNotification(userPushSubs[userId], {
-              title: `חדשות ל־${symbol}`,
-              body: `${event.headline ? event.headline : 'אירוע משמעותי'} — הסיכון עכשיו: ${res.overallRiskScore}/10`,
-              icon: '/icons/news.png',
-              data: { symbol, event }
-            });
-            log.info(`📲 נשלחה Push על אירוע ל-${userId} עבור ${symbol}`);
-          } catch (pushErr) {
-            log.error('Push error on event notify', pushErr.message);
-          }
-        }
-
-        // email summary (optional for big events)
-        if (p.userEmail) {
-          try {
-            await sendEmail({
-              to: p.userEmail,
-              subject: `אירוע חשוב ב־${symbol}: ${event.headline ? event.headline : 'אירוע'}`,
-              html: `<h3>אירוע ב־${symbol}</h3><p>${event.headline || event.summary || JSON.stringify(event)}</p><p>רמת סיכון עכשווית: ${res.overallRiskScore}/10</p>`
-            });
-            log.info(`📧 נשלח מייל אירוע ל-${userId} עבור ${symbol}`);
-          } catch (mailErr) {
-            log.error('Mail error on event notify', mailErr.message);
-          }
-        }
-
-        // SSE event
-        pushUpdate(userId, { type: 'finnhub-event', symbol, event, risk: res.overallRiskScore });
+      if (res && userPushSubs[userId]) {
+        try { await sendPushNotification(userPushSubs[userId], { title: `חדשות ל־${symbol}`, body: `${event.headline || 'אירוע משמעותי'} — סיכון: ${res.overallRiskScore}/10`, icon: '/icons/news.png', data: { symbol, event } }); } catch (pushErr) { log.error('Push error on event notify', pushErr.message); }
       }
-    } catch (err) {
-      log.error('handleEventForTicker error', err.message);
-    }
+      if (res && p.userEmail) {
+        try { await sendEmail({ to: p.userEmail, subject: `אירוע חשוב ב־${symbol}: ${event.headline || 'אירוע'}`, html: `<h3>אירוע ב־${symbol}</h3><p>${event.headline || event.summary || JSON.stringify(event)}</p><p>סיכון: ${res.overallRiskScore}/10</p>` }); } catch (mailErr) { log.error('Mail error on event notify', mailErr.message); }
+      }
+      pushUpdate(userId, { type: 'finnhub-event', symbol, event, risk: res?.overallRiskScore });
+    } catch (err) { log.error('handleEventForTicker error', err.message); }
   }
 }
 
-// Poll Finnhub for events every N minutes (configurable)
 const FINNHUB_POLL_MINUTES = Number(process.env.FINNHUB_POLL_MINUTES || 5);
 async function pollFinnhubEvents() {
   if (!FINNHUB_KEY) return;
   try {
-    // gather unique tickers watched across users
     const tickersSet = new Set();
-    for (const uid in userPortfolios) {
-      const p = userPortfolios[uid];
-      if (!p.stocks) continue;
-      for (const s in p.stocks) tickersSet.add(s);
-    }
+    for (const uid in userPortfolios) { const p = userPortfolios[uid]; if (!p.stocks) continue; for (const s in p.stocks) tickersSet.add(s); }
     const tickers = Array.from(tickersSet);
     if (tickers.length === 0) return;
 
     const toISO = dayjs().format('YYYY-MM-DD');
-    const fromISO = dayjs().subtract(1, 'day').format('YYYY-MM-DD'); // check last 24h news/earnings
+    const fromISO = dayjs().subtract(1,'day').format('YYYY-MM-DD');
 
     for (const symbol of tickers) {
       try {
-        // company news
         const news = await fetchCompanyNews(symbol, fromISO, toISO);
-        for (const item of news) {
-          // item has fields: category, datetime, headline, id, image, related, source, summary, url
-          await handleEventForTicker(symbol, item);
-        }
+        for (const item of news) await handleEventForTicker(symbol, item);
 
-        // earnings (latest quarter) — we look for recent earnings events (could be improved)
         const earnings = await fetchEarnings(symbol);
-        if (Array.isArray(earnings) && earnings.length > 0) {
-          // filter recent earnings in last 2 days
-          for (const e of earnings) {
-            const epsDate = e.period || e.time || e.date || null;
-            // use e.actual and e.estimate to detect surprises
-            // treat each earnings report as an event
-            await handleEventForTicker(symbol, e);
-          }
+        if (Array.isArray(earnings)) {
+          for (const e of earnings) await handleEventForTicker(symbol, e);
         }
-      } catch (err) {
-        log.error('pollFinnhubEvents per-ticker error', symbol, err.message);
-      }
+      } catch (err) { log.error('pollFinnhubEvents per-ticker error', symbol, err.message); }
     }
-  } catch (err) {
-    log.error('pollFinnhubEvents error', err.message);
-  }
+  } catch (err) { log.error('pollFinnhubEvents error', err.message); }
 }
 
-// schedule event polling
-setInterval(pollFinnhubEvents, FINNHUB_POLL_MINUTES * 60_000);
+setInterval(pollFinnhubEvents, FINNHUB_POLL_MINUTES*60_000);
 pollFinnhubEvents().catch(err => log.error('initial poll error', err.message));
 
 // ====== HTTP Routes ======
 app.get('/', (req, res) => res.send('✅ RiskWise AI Server Online (Events + Push)'));
 
-// Update portfolio
 app.post('/update-portfolio', (req, res) => {
   const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
   if (!userId || !stocks) return res.status(400).json({ error: 'חסרים נתונים' });
   userPortfolios[userId] = { stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment };
   log.info(`🔁 Portfolio updated for ${userId}:`, Object.keys(stocks));
+
+  // subscribe to live tickers
+  Object.keys(stocks).forEach(symbol => subscribeToLiveTicker(symbol));
+
   res.json({ message: 'Portfolio updated' });
 });
 
-// Subscribe push
 app.post('/subscribe', (req, res) => {
   const { userId, subscription } = req.body;
   if (!userId || !subscription) return res.status(400).json({ error: 'Missing userId or subscription' });
@@ -379,7 +343,6 @@ app.post('/subscribe', (req, res) => {
   res.json({ message: 'Subscribed successfully for push notifications' });
 });
 
-// SSE endpoint
 app.get('/events/:userId', (req, res) => {
   const userId = req.params.userId;
   res.setHeader('Content-Type', 'text/event-stream');
@@ -388,83 +351,34 @@ app.get('/events/:userId', (req, res) => {
   res.flushHeaders();
   if (!sseClients[userId]) sseClients[userId] = [];
   sseClients[userId].push(res);
-  req.on('close', () => {
-    sseClients[userId] = sseClients[userId].filter(r => r !== res);
-  });
+  req.on('close', () => { sseClients[userId] = sseClients[userId].filter(r => r !== res); });
 });
 
-// Expose risk endpoint (single ticker)
 app.get('/risk/:ticker', async (req, res) => {
   const ticker = (req.params.ticker || '').toUpperCase();
   if (!ticker) return res.status(400).json({ error: 'ticker required' });
   try {
-    // no user context — call analyzer directly
     const analysis = await analyzeStockRisk(ticker);
     const overallRiskScore = analysis?.overallRiskScore ?? analysis?.riskScore ?? null;
     res.json({ ticker, risk: overallRiskScore, analysis });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Bulk risk
-app.post('/risk/bulk', async (req, res) => {
-  const tickers = req.body.tickers || [];
-  if (!Array.isArray(tickers) || tickers.length === 0) return res.status(400).json({ error: 'tickers required' });
-  try {
-    const promises = tickers.map(t => analyzeStockRisk(t));
-    const results = await Promise.all(promises);
-    const mapped = tickers.map((t, i) => ({ ticker: t.toUpperCase(), risk: results[i]?.overallRiskScore ?? results[i]?.riskScore ?? null, analysis: results[i] }));
-    res.json({ results: mapped });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// webhook endpoint to force recalculation
-app.post('/webhook/event', async (req, res) => {
-  const { ticker } = req.body;
-  if (!ticker) return res.status(400).json({ error: 'ticker required' });
-
-  // clear seen events for ticker to allow re-notify if desired
-  seenFinnhubEvents[ticker] = {};
-
-  // trigger recalculation for users watching ticker
+// ====== Cron Weekly Risk Recalculation ======
+cron.schedule('0 12 * * FRI', async () => {
+  log.info('🔁 Cron: Weekly risk recalculation triggered');
   for (const userId in userPortfolios) {
-    const p = userPortfolios[userId];
-    if (p.stocks && p.stocks[ticker]) {
-      try {
-        const price = p.alpacaKeys ? await getAlpacaPrice(ticker, p.alpacaKeys.key, p.alpacaKeys.secret) : await getFinnhubPrice(ticker);
-        const resCalc = await calculateFullRisk(userId, ticker, price, p);
-        if (resCalc) {
-          await updateStopLossAndNotify(userId, ticker, p, price, resCalc.overallRiskScore);
-          pushUpdate(userId, { type: 'webhook-recalc', ticker, price, risk: resCalc.overallRiskScore });
-        }
-      } catch (err) {
-        log.error('Webhook recalculation error for', ticker, err.message);
-      }
+    const portfolio = userPortfolios[userId];
+    for (const symbol in portfolio.stocks) {
+      const price = portfolio.alpacaKeys
+        ? await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret)
+        : await getFinnhubPrice(symbol);
+      const res = await calculateFullRisk(userId, symbol, price, portfolio);
+      if (res) await updateStopLossAndNotify(userId, symbol, portfolio, price, res.overallRiskScore);
     }
   }
-
-  res.json({ ok: true });
 });
 
-// ====== Background jobs & start server ======
-app.listen(PORT, () => {
-  log.info(`✅ Server started on port ${PORT}`);
-  // Run price-check every minute
-  setInterval(checkAndUpdatePrices, 60 * 1000);
-  // initial run
-  checkAndUpdatePrices().catch(e => log.error('initial price check error', e.message));
-});
-
-// Weekly cron example (Friday 14:00)
-cron.schedule('0 14 * * 5', async () => {
-  try {
-    log.info('Weekly scheduled run: checkAndUpdatePrices');
-    await checkAndUpdatePrices();
-    await pollFinnhubEvents();
-  } catch (e) {
-    log.error('Scheduled job error', e.message);
-  }
-});
+// ====== Start server + polling loop ======
+app.listen(PORT, () => log.info(`🚀 RiskWise AI Server running on port ${PORT}`));
+setInterval(checkAndUpdatePrices, 60*1000); // run every 1 min
