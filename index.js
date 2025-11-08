@@ -14,7 +14,11 @@ const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
 const { sendEmail } = require('./emailService');
 const { analyzeStockRisk } = require('./riskAnalyzer');
 const { sendPushNotification } = require('./pushServices'); // פונקציה ששולחת push דרך web-push
-const log = console;
+const log = {
+  info: (...args) => console.log('[INFO]', ...args),
+  warn: (...args) => console.warn('[WARN]', ...args),
+  error: (...args) => console.error('[ERROR]', ...args),
+};
 
 const app = express();
 const PORT = process.env.PORT || 3000;
