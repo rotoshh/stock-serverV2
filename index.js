@@ -1,5 +1,5 @@
 // ===========================================
-// index.js – RiskWise AI Server (Push + Event Polling from Finnhub, No Base44)
+// index.js – RiskWise AI Server (Push + Event Polling + Finnhub WS)
 // ===========================================
 require('dotenv').config();
 const express = require('express');
@@ -7,6 +7,7 @@ const cors = require('cors');
 const cron = require('node-cron');
 const axios = require('axios');
 const dayjs = require('dayjs');
+const WebSocket = require('ws');
 
 const { getRealTimePrice: getAlpacaPrice } = require('./alpacaPriceFetcher');
 const { getRealTimePrice: getFinnhubPrice } = require('./finnhubPriceFetcher');
@@ -19,7 +20,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const FINNHUB_KEY = process.env.FINNHUB_API_KEY || '';
 
-if (!FINNHUB_KEY) console.warn('WARNING: FINNHUB_API_KEY not set — event polling and news will not work.');
+// safety: minimal config
+if (!FINNHUB_KEY) log.warn('WARNING: FINNHUB_API_KEY not set — event polling and news will not work.');
 
 // ---- CORS ----
 const allowedOrigins = [
@@ -45,13 +47,126 @@ const sseClients = {};          // userId -> [res, ...]
 const userPushSubs = {};        // userId -> pushSubscription
 const seenFinnhubEvents = {};   // ticker -> { eventId: timestamp } to avoid duplicate notifications
 
+// ====== Finnhub WebSocket (real-time) with safe reconnect/backoff ======
+let finnhubSocket = null;
+let subscribedTickers = new Set();
+let reconnectDelayMs = 10_000; // start 10s, exponential backoff up to cap
+const RECONNECT_MAX_MS = 60_000; // max 60s
+const FINNHUB_FREE_TICKER_LIMIT = 30; // safe default for free plan
+
+function connectFinnhubStream() {
+  if (!FINNHUB_KEY) {
+    log.warn('⚠️ No FINNHUB_API_KEY — skipping live price stream');
+    return;
+  }
+
+  // avoid opening duplicate sockets
+  if (finnhubSocket && (finnhubSocket.readyState === WebSocket.OPEN || finnhubSocket.readyState === WebSocket.CONNECTING)) {
+    log.info('🟢 Finnhub WebSocket already open/connecting — skipping new connect.');
+    return;
+  }
+
+  try {
+    finnhubSocket = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_KEY}`);
+
+    finnhubSocket.on('open', () => {
+      log.info('📡 Connected to Finnhub live price stream');
+      // reset backoff
+      reconnectDelayMs = 10_000;
+      // subscribe existing tickers
+      for (const symbol of subscribedTickers) {
+        try {
+          finnhubSocket.send(JSON.stringify({ type: 'subscribe', symbol }));
+        } catch (e) {
+          log.error('Failed to subscribe to', symbol, e.message);
+        }
+      }
+    });
+
+    finnhubSocket.on('message', (msg) => {
+      try {
+        const data = JSON.parse(msg);
+        // Finnhub trade messages: { type: 'trade', data: [ { s: 'AAPL', p: 123.45, ... }, ... ] }
+        if (data.type === 'trade' && Array.isArray(data.data)) {
+          data.data.forEach(t => {
+            const { s: symbol, p: price } = t;
+            if (!symbol) return;
+            // broadcast to users who watch this symbol
+            for (const userId in userPortfolios) {
+              const portfolio = userPortfolios[userId];
+              if (!portfolio || !portfolio.stocks) continue;
+              if (portfolio.stocks[symbol]) {
+                portfolio.stocks[symbol].lastPrice = price;
+                // quick price SSE (type 'price')
+                pushUpdate(userId, { type: 'price', symbol, price });
+              }
+            }
+          });
+        }
+      } catch (err) {
+        log.error('⚠️ Finnhub stream parse error', err.message);
+      }
+    });
+
+    finnhubSocket.on('close', (code, reason) => {
+      log.warn('🔌 Finnhub WebSocket closed — reconnecting in a bit...', code, reason?.toString?.() || reason);
+      // schedule reconnect with backoff
+      setTimeout(() => {
+        reconnectDelayMs = Math.min(RECONNECT_MAX_MS, reconnectDelayMs * 2);
+        connectFinnhubStream();
+      }, reconnectDelayMs);
+    });
+
+    finnhubSocket.on('error', (err) => {
+      // often 429 or network-related
+      log.error('❌ Finnhub WS error:', err?.message || err);
+      try {
+        finnhubSocket.close();
+      } catch (e) {}
+    });
+  } catch (err) {
+    log.error('Failed to create Finnhub WebSocket', err.message);
+    setTimeout(connectFinnhubStream, reconnectDelayMs);
+    reconnectDelayMs = Math.min(RECONNECT_MAX_MS, reconnectDelayMs * 2);
+  }
+}
+
+// subscribe helper - enforces a limit for free tier
+function subscribeToLiveTicker(symbol) {
+  if (!symbol || !FINNHUB_KEY) return;
+  if (subscribedTickers.has(symbol)) return;
+
+  // enforce safe limit for free tier to avoid 429
+  if (subscribedTickers.size >= FINNHUB_FREE_TICKER_LIMIT) {
+    log.warn(`⚠️ Skipping live subscribe for ${symbol} — reached safe limit (${FINNHUB_FREE_TICKER_LIMIT})`);
+    return;
+  }
+
+  subscribedTickers.add(symbol);
+  if (finnhubSocket && finnhubSocket.readyState === WebSocket.OPEN) {
+    try {
+      finnhubSocket.send(JSON.stringify({ type: 'subscribe', symbol }));
+      log.info(`🔔 Subscribed to live ticker ${symbol}`);
+    } catch (e) {
+      log.error('Failed to send subscribe message for', symbol, e.message);
+    }
+  }
+}
+
+// start websocket connection (if key present)
+connectFinnhubStream();
+
 // ====== SSE HELPERS ======
 function pushUpdate(userId, data) {
   if (sseClients[userId]) {
     sseClients[userId].forEach(res => {
-      try { res.write(data: ${JSON.stringify(data)}\n\n); } catch (e) {}
+      try {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      } catch (e) {
+        // ignore write errors for closed clients
+      }
     });
-    log.info(📡 נשלח עדכון SSE ל-${userId}:, data);
+    log.info(`📡 נשלח עדכון SSE ל-${userId}:`, data);
   }
 }
 
@@ -59,7 +174,7 @@ function pushUpdate(userId, data) {
 setInterval(() => {
   for (const userId in sseClients) {
     sseClients[userId].forEach(res => {
-      try { res.write(data: ${JSON.stringify({ type: "ping", ts: Date.now() })}\n\n); } catch (e) {}
+      try { res.write(`data: ${JSON.stringify({ type: "ping", ts: Date.now() })}\n\n`); } catch (e) {}
     });
   }
 }, 30_000);
@@ -88,10 +203,10 @@ async function calculateFullRisk(userId, symbol, currentPrice, portfolio) {
       details: analysis
     });
 
-    log.info(📊 ${symbol} סיכון כולל: ${overallRiskScore}/10 | β=${analysis.beta} σ=${analysis.volatility});
+    log.info(`📊 ${symbol} סיכון כולל: ${overallRiskScore}/10 | β=${analysis.beta} σ=${analysis.volatility}`);
     return { overallRiskScore, analysis };
   } catch (e) {
-    log.error(❌ שגיאה בחישוב סיכון עבור ${symbol}: ${e.message});
+    log.error(`❌ שגיאה בחישוב סיכון עבור ${symbol}: ${e.message}`);
     return null;
   }
 }
@@ -116,8 +231,8 @@ async function updateStopLossAndNotify(userId, symbol, portfolio, currentPrice, 
       // send email
       if (portfolio.userEmail) {
         try {
-          await sendEmail({ to: portfolio.userEmail, subject: עדכון סטופ לוס - ${symbol}, html: msg });
-          log.info(📧 נשלח מייל עדכון סטופ לוס עבור ${symbol} (${userId}));
+          await sendEmail({ to: portfolio.userEmail, subject: `עדכון סטופ לוס - ${symbol}`, html: msg });
+          log.info(`📧 נשלח מייל עדכון סטופ לוס עבור ${symbol} (${userId})`);
         } catch (mailErr) {
           log.error('שגיאה בשליחת אימייל:', mailErr.message);
         }
@@ -130,11 +245,11 @@ async function updateStopLossAndNotify(userId, symbol, portfolio, currentPrice, 
       if (userPushSubs[userId]) {
         try {
           await sendPushNotification(userPushSubs[userId], {
-            title: עדכון סטופ לוס – ${symbol},
-            body: סטופ לוס חדש נקבע על $${newStopLoss} (סיכון ${overallRiskScore}/10),
+            title: `עדכון סטופ לוס – ${symbol}`,
+            body: `סטופ לוס חדש נקבע על $${newStopLoss} (סיכון ${overallRiskScore}/10)`,
             icon: '/icons/stoploss.png'
           });
-          log.info(📲 נשלחה התראת Push עדכון סטופ לוס ל-${userId});
+          log.info(`📲 נשלחה התראת Push עדכון סטופ לוס ל-${userId}`);
         } catch (pushErr) {
           log.error('שגיאה בשליחת Push:', pushErr.message);
         }
@@ -154,7 +269,7 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
   if (history && (now - history.time) <= 15 * 60 * 1000) {
     const change = ((currentPrice - history.price) / history.price) * 100;
     if (change <= -5) {
-      log.warn(📉 ירידה ${change.toFixed(2)}% ב-15 דק' עבור ${symbol} (${userId}));
+      log.warn(`📉 ירידה ${change.toFixed(2)}% ב-15 דק' עבור ${symbol} (${userId})`);
 
       // recalc risk
       const res = await calculateFullRisk(userId, symbol, currentPrice, portfolio);
@@ -166,11 +281,11 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
       if (userPushSubs[userId]) {
         try {
           await sendPushNotification(userPushSubs[userId], {
-            title: 📉 ירידה חדה: ${symbol},
-            body: ${symbol} ירדה ${change.toFixed(2)}% ב-15 הדקות האחרונות.,
+            title: `📉 ירידה חדה: ${symbol}`,
+            body: `${symbol} ירדה ${change.toFixed(2)}% ב-15 הדקות האחרונות.`,
             icon: '/icons/drop.png'
           });
-          log.info(📲 נשלחה התראת Push ירידה חדה ל-${userId});
+          log.info(`📲 נשלחה התראת Push ירידה חדה ל-${userId}`);
         } catch (e) {
           log.error('שגיאת Push pada 15min drop', e.message);
         }
@@ -187,6 +302,8 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
 async function checkAndUpdatePrices() {
   for (const userId in userPortfolios) {
     const portfolio = userPortfolios[userId];
+    if (!portfolio || !portfolio.stocks) continue;
+
     for (const symbol in portfolio.stocks) {
       try {
         const price = portfolio.alpacaKeys
@@ -201,84 +318,62 @@ async function checkAndUpdatePrices() {
 
         // calculate advanced risk and update stoploss
         const res = await calculateFullRisk(userId, symbol, price, portfolio);
-        if (res) {
-          await updateStopLossAndNotify(userId, symbol, portfolio, price, res.overallRiskScore);
-        }
+        if (res) await updateStopLossAndNotify(userId, symbol, portfolio, price, res.overallRiskScore);
 
       } catch (err) {
-        log.error(❌ שגיאה בעדכון ${symbol} (${userId}): ${err.message});
+        log.error(`❌ שגיאה בעדכון ${symbol} (${userId}): ${err.message}`);
       }
     }
   }
 }
 
-// ====== Finnhub event polling: news + earnings ======
-
-// helper: fetch company news for a ticker between dates (Finnhub API)
+// ====== Finnhub event polling (news + earnings) ======
 async function fetchCompanyNews(symbol, fromISO, toISO) {
   if (!FINNHUB_KEY) return [];
   try {
-    const url = https://finnhub.io/api/v1/company-news;
+    const url = 'https://finnhub.io/api/v1/company-news';
     const res = await axios.get(url, { params: { symbol, from: fromISO, to: toISO, token: FINNHUB_KEY }, timeout: 10000 });
     return res.data || [];
-  } catch (err) {
-    log.error('fetchCompanyNews error', symbol, err.message);
-    return [];
-  }
+  } catch (err) { log.error('fetchCompanyNews error', symbol, err.message); return []; }
 }
 
-// helper: fetch earnings (latest) — Finnhub /stock/earnings
 async function fetchEarnings(symbol) {
   if (!FINNHUB_KEY) return [];
   try {
-    const url = https://finnhub.io/api/v1/stock/earnings;
+    const url = 'https://finnhub.io/api/v1/stock/earnings';
     const res = await axios.get(url, { params: { symbol, token: FINNHUB_KEY }, timeout: 10000 });
     return res.data || [];
-  } catch (err) {
-    log.error('fetchEarnings error', symbol, err.message);
-    return [];
-  }
+  } catch (err) { log.error('fetchEarnings error', symbol, err.message); return []; }
 }
 
-// Event handling: when we detect new event -> recalc + push + email/push to affected users
 async function handleEventForTicker(symbol, event) {
-  // generate a stable event id (use url / datetime / category)
-  const eventId = event.id || event.gid || ${symbol}::${event.headline || event.category || event.datetime || event.date || Math.random()};
+  const eventId = event.id || event.gid || `${symbol}::${event.headline || event.category || event.datetime || event.date || Math.random()}`;
   const now = Date.now();
   seenFinnhubEvents[symbol] = seenFinnhubEvents[symbol] || {};
-
-  // dedupe: ignore if seen recently (24h)
-  if (seenFinnhubEvents[symbol][eventId] && (now - seenFinnhubEvents[symbol][eventId] < 24 * 60 * 60 * 1000)) {
-    return;
-  }
+  if (seenFinnhubEvents[symbol][eventId] && (now - seenFinnhubEvents[symbol][eventId] < 24*60*60*1000)) return;
   seenFinnhubEvents[symbol][eventId] = now;
 
-  log.info(🛰 אירוע חדש ל-${symbol}:, event.headline || event.summary || event.type || event);
+  log.info(`🛰️ אירוע חדש ל-${symbol}:`, event.headline || event.summary || event.type || event);
 
-  // notify all users who have this ticker in portfolio
   for (const userId in userPortfolios) {
     const p = userPortfolios[userId];
     if (!p.stocks || !p.stocks[symbol]) continue;
 
     try {
-      // get current price
-      const price = p.alpacaKeys
-        ? await getAlpacaPrice(symbol, p.alpacaKeys.key, p.alpacaKeys.secret)
-        : await getFinnhubPrice(symbol);
-
-      // recompute risk
+      const price = p.alpacaKeys ? await getAlpacaPrice(symbol, p.alpacaKeys.key, p.alpacaKeys.secret) : await getFinnhubPrice(symbol);
       const res = await calculateFullRisk(userId, symbol, price, p);
+
       if (res) {
-        // send push about event
+        // push notification for event
         if (userPushSubs[userId]) {
           try {
             await sendPushNotification(userPushSubs[userId], {
-              title: חדשות ל־${symbol},
-              body: ${event.headline ? event.headline : 'אירוע משמעותי'} — הסיכון עכשיו: ${res.overallRiskScore}/10,
+              title: `חדשות ל־${symbol}`,
+              body: `${event.headline ? event.headline : 'אירוע משמעותי'} — הסיכון עכשיו: ${res.overallRiskScore}/10`,
               icon: '/icons/news.png',
               data: { symbol, event }
             });
-            log.info(📲 נשלחה Push על אירוע ל-${userId} עבור ${symbol});
+            log.info(`📲 נשלחה Push על אירוע ל-${userId} עבור ${symbol}`);
           } catch (pushErr) {
             log.error('Push error on event notify', pushErr.message);
           }
@@ -289,10 +384,10 @@ async function handleEventForTicker(symbol, event) {
           try {
             await sendEmail({
               to: p.userEmail,
-              subject: אירוע חשוב ב־${symbol}: ${event.headline ? event.headline : 'אירוע'},
-              html: <h3>אירוע ב־${symbol}</h3><p>${event.headline || event.summary || JSON.stringify(event)}</p><p>רמת סיכון עכשווית: ${res.overallRiskScore}/10</p>
+              subject: `אירוע חשוב ב־${symbol}: ${event.headline ? event.headline : 'אירוע'}`,
+              html: `<h3>אירוע ב־${symbol}</h3><p>${event.headline || event.summary || JSON.stringify(event)}</p><p>רמת סיכון עכשווית: ${res.overallRiskScore}/10</p>`
             });
-            log.info(📧 נשלח מייל אירוע ל-${userId} עבור ${symbol});
+            log.info(`📧 נשלח מייל אירוע ל-${userId} עבור ${symbol}`);
           } catch (mailErr) {
             log.error('Mail error on event notify', mailErr.message);
           }
@@ -307,7 +402,6 @@ async function handleEventForTicker(symbol, event) {
   }
 }
 
-// Poll Finnhub for events every N minutes (configurable)
 const FINNHUB_POLL_MINUTES = Number(process.env.FINNHUB_POLL_MINUTES || 5);
 async function pollFinnhubEvents() {
   if (!FINNHUB_KEY) return;
@@ -323,35 +417,22 @@ async function pollFinnhubEvents() {
     if (tickers.length === 0) return;
 
     const toISO = dayjs().format('YYYY-MM-DD');
-    const fromISO = dayjs().subtract(1, 'day').format('YYYY-MM-DD'); // check last 24h news/earnings
+    const fromISO = dayjs().subtract(1,'day').format('YYYY-MM-DD');
 
     for (const symbol of tickers) {
       try {
         // company news
         const news = await fetchCompanyNews(symbol, fromISO, toISO);
-        for (const item of news) {
-          // item has fields: category, datetime, headline, id, image, related, source, summary, url
-          await handleEventForTicker(symbol, item);
-        }
+        for (const item of news) await handleEventForTicker(symbol, item);
 
-        // earnings (latest quarter) — we look for recent earnings events (could be improved)
+        // earnings (latest quarter)
         const earnings = await fetchEarnings(symbol);
         if (Array.isArray(earnings) && earnings.length > 0) {
-          // filter recent earnings in last 2 days
-          for (const e of earnings) {
-            const epsDate = e.period || e.time || e.date || null;
-            // use e.actual and e.estimate to detect surprises
-            // treat each earnings report as an event
-            await handleEventForTicker(symbol, e);
-          }
+          for (const e of earnings) await handleEventForTicker(symbol, e);
         }
-      } catch (err) {
-        log.error('pollFinnhubEvents per-ticker error', symbol, err.message);
-      }
+      } catch (err) { log.error('pollFinnhubEvents per-ticker error', symbol, err.message); }
     }
-  } catch (err) {
-    log.error('pollFinnhubEvents error', err.message);
-  }
+  } catch (err) { log.error('pollFinnhubEvents error', err.message); }
 }
 
 // schedule event polling
@@ -361,25 +442,29 @@ pollFinnhubEvents().catch(err => log.error('initial poll error', err.message));
 // ====== HTTP Routes ======
 app.get('/', (req, res) => res.send('✅ RiskWise AI Server Online (Events + Push)'));
 
-// Update portfolio
 app.post('/update-portfolio', (req, res) => {
   const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
   if (!userId || !stocks) return res.status(400).json({ error: 'חסרים נתונים' });
+
+  // sanitize/normalize stocks object shape expected by server:
+  // stocks = { "AAPL": { sector: 'Technology', ... }, "TSLA": {...} }
   userPortfolios[userId] = { stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment };
-  log.info(🔁 Portfolio updated for ${userId}:, Object.keys(stocks));
+  log.info(`🔁 Portfolio updated for ${userId}:`, Object.keys(stocks || {}));
+
+  // subscribe to live tickers (respecting limit)
+  Object.keys(stocks || {}).forEach(symbol => subscribeToLiveTicker(symbol));
+
   res.json({ message: 'Portfolio updated' });
 });
 
-// Subscribe push
 app.post('/subscribe', (req, res) => {
   const { userId, subscription } = req.body;
   if (!userId || !subscription) return res.status(400).json({ error: 'Missing userId or subscription' });
   userPushSubs[userId] = subscription;
-  log.info(🔔 משתמש ${userId} נרשם להתראות Push);
+  log.info(`🔔 משתמש ${userId} נרשם להתראות Push`);
   res.json({ message: 'Subscribed successfully for push notifications' });
 });
 
-// SSE endpoint
 app.get('/events/:userId', (req, res) => {
   const userId = req.params.userId;
   res.setHeader('Content-Type', 'text/event-stream');
@@ -393,7 +478,6 @@ app.get('/events/:userId', (req, res) => {
   });
 });
 
-// Expose risk endpoint (single ticker)
 app.get('/risk/:ticker', async (req, res) => {
   const ticker = (req.params.ticker || '').toUpperCase();
   if (!ticker) return res.status(400).json({ error: 'ticker required' });
@@ -402,12 +486,9 @@ app.get('/risk/:ticker', async (req, res) => {
     const analysis = await analyzeStockRisk(ticker);
     const overallRiskScore = analysis?.overallRiskScore ?? analysis?.riskScore ?? null;
     res.json({ ticker, risk: overallRiskScore, analysis });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Bulk risk
 app.post('/risk/bulk', async (req, res) => {
   const tickers = req.body.tickers || [];
   if (!Array.isArray(tickers) || tickers.length === 0) return res.status(400).json({ error: 'tickers required' });
@@ -416,9 +497,7 @@ app.post('/risk/bulk', async (req, res) => {
     const results = await Promise.all(promises);
     const mapped = tickers.map((t, i) => ({ ticker: t.toUpperCase(), risk: results[i]?.overallRiskScore ?? results[i]?.riskScore ?? null, analysis: results[i] }));
     res.json({ results: mapped });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // webhook endpoint to force recalculation
@@ -449,9 +528,27 @@ app.post('/webhook/event', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ====== Background jobs & start server ======
+// ====== Cron Weekly Risk Recalculation ======
+cron.schedule('0 12 * * FRI', async () => {
+  log.info('🔁 Cron: Weekly risk recalculation triggered');
+  for (const userId in userPortfolios) {
+    const portfolio = userPortfolios[userId];
+    if (!portfolio || !portfolio.stocks) continue;
+    for (const symbol in portfolio.stocks) {
+      try {
+        const price = portfolio.alpacaKeys ? await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret) : await getFinnhubPrice(symbol);
+        const res = await calculateFullRisk(userId, symbol, price, portfolio);
+        if (res) await updateStopLossAndNotify(userId, symbol, portfolio, price, res.overallRiskScore);
+      } catch (e) {
+        log.error('Weekly cron error for', symbol, e.message);
+      }
+    }
+  }
+});
+
+// ====== Start server + polling loop ======
 app.listen(PORT, () => {
-  log.info(✅ Server started on port ${PORT});
+  log.info(`✅ Server started on port ${PORT}`);
   // Run price-check every minute
   setInterval(checkAndUpdatePrices, 60 * 1000);
   // initial run
@@ -466,5 +563,5 @@ cron.schedule('0 14 * * 5', async () => {
     await pollFinnhubEvents();
   } catch (e) {
     log.error('Scheduled job error', e.message);
-  }
+  }
 });
