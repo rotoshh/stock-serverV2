@@ -1,5 +1,5 @@
 // ===========================================
-// index.js – RiskWise AI Server (Push + Event Polling + Finnhub WS)
+// index.js – RiskWise AI Server (Push + Event Polling + Finnhub WS + Portfolio-level Stops)
 // ===========================================
 require('dotenv').config();
 const express = require('express');
@@ -41,7 +41,7 @@ app.use(cors({
 app.use(express.json({ limit: '2mb' }));
 
 // ====== MEMORY DB ======
-const userPortfolios = {};      // userId -> { stocks: { SYMBOL: {...} }, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment }
+const userPortfolios = {};      // userId -> { stocks: { SYMBOL: {...} }, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment, targetPortfolioLossPercent }
 const priceHistory15Min = {};   // userId -> { SYMBOL: { price, time } }
 const sseClients = {};          // userId -> [res, ...]
 const userPushSubs = {};        // userId -> pushSubscription
@@ -121,7 +121,7 @@ function connectFinnhubStream() {
       // often 429 or network-related
       log.error('❌ Finnhub WS error:', err?.message || err);
       try {
-        finnhubSocket.close();
+        if (finnhubSocket && finnhubSocket.readyState !== WebSocket.CLOSED) finnhubSocket.close();
       } catch (e) {}
     });
   } catch (err) {
@@ -258,6 +258,116 @@ async function updateStopLossAndNotify(userId, symbol, portfolio, currentPrice, 
   } catch (err) {
     log.error('updateStopLossAndNotify error', err.message);
   }
+}
+
+// ====== Portfolio-level stop computation ======
+/**
+ * computeAndApplyPortfolioStops(userId, targetPercent)
+ * - targetPercent: decimal (e.g. 0.05 for 5%)
+ * stores stopLoss in portfolio.stocks[symbol].stopLoss
+ * sends SSE 'stoploss-batch-updated'
+ */
+function computeAndApplyPortfolioStops(userId, targetPercent) {
+  const portfolio = userPortfolios[userId];
+  if (!portfolio || !portfolio.stocks) {
+    log.warn('computeAndApplyPortfolioStops: no portfolio for', userId);
+    return;
+  }
+  const stocks = portfolio.stocks;
+  const symbols = Object.keys(stocks);
+  if (symbols.length === 0) return;
+
+  // Read total investment (fallbacks)
+  let totalInvestment = Number(portfolio.totalInvestment || 0);
+  if (!totalInvestment || totalInvestment <= 0) {
+    // try sum of provided positionValue
+    let sumPos = 0;
+    symbols.forEach(sym => {
+      const p = stocks[sym];
+      if (p.positionValue) sumPos += Number(p.positionValue);
+    });
+    if (sumPos > 0) {
+      totalInvestment = sumPos;
+    } else {
+      // fallback: estimate from prices
+      let sumEst = 0;
+      symbols.forEach(sym => {
+        const p = stocks[sym];
+        const price = Number(p.lastPrice || p.entryPrice || 0) || 0;
+        sumEst += price || 0;
+      });
+      totalInvestment = sumEst || 1; // avoid zero
+      log.warn(`computeAndApplyPortfolioStops: no totalInvestment provided for ${userId}, estimated ${totalInvestment}`);
+    }
+    portfolio.totalInvestment = totalInvestment;
+  }
+
+  const L = Number(targetPercent);
+  if (!L || L <= 0) {
+    log.warn('computeAndApplyPortfolioStops: invalid targetPercent', targetPercent);
+    return;
+  }
+
+  const AllowedLoss = L * totalInvestment; // dollars
+  const maxRisk = 10;
+  const stockData = [];
+
+  for (const sym of symbols) {
+    const p = stocks[sym];
+    const price = Number(p.lastPrice || p.entryPrice || 0);
+    let shares = Number(p.shares || 0);
+    let positionValue = Number(p.positionValue || 0);
+    if ((!shares || shares <= 0) && positionValue > 0 && price > 0) {
+      shares = positionValue / price;
+    }
+    if ((!shares || shares <= 0) && price > 0) {
+      shares = 1;
+      positionValue = price;
+    } else {
+      positionValue = positionValue || (shares * price);
+    }
+    const risk = Number(p.overallRisk ?? p.risk ?? 5);
+    stockData.push({ sym, price, shares, positionValue, risk, original: p });
+  }
+
+  // weights: safer stocks (lower risk) get larger w
+  let wSum = 0;
+  stockData.forEach(s => {
+    s.w = Math.max(0.0001, (maxRisk - s.risk + 1));
+    wSum += s.w;
+  });
+
+  const MIN_STOP_PCT = 0.005; // 0.5% minimum distance
+
+  stockData.forEach(s => {
+    const allowedLoss_i = AllowedLoss * (s.w / wSum);
+    const deltaPrice = allowedLoss_i / (s.shares || 1); // $ per share
+    const entryPrice = Number(s.original.entryPrice || s.price);
+    let stopPrice = entryPrice - deltaPrice;
+
+    // if stopPrice >= current price -> set a tight stop slightly below current price
+    if (stopPrice >= s.price) {
+      stopPrice = Number((s.price * (1 - MIN_STOP_PCT)).toFixed(4));
+    }
+
+    // enforce minimum distance (i.e. stop cannot be further from price than minStop)
+    const minStop = Number((s.price * (1 - MIN_STOP_PCT)).toFixed(4));
+    if (stopPrice > minStop) {
+      stopPrice = minStop;
+    }
+
+    s.original.stopLoss = Number(stopPrice.toFixed(2));
+    s.original._computedStop = { allowedLoss_i: Number(allowedLoss_i.toFixed(2)), deltaPrice: Number(deltaPrice.toFixed(4)) };
+  });
+
+  // SSE and logging
+  const stopsPayload = {};
+  stockData.forEach(s => {
+    stopsPayload[s.sym] = { stopLoss: s.original.stopLoss, computed: s.original._computedStop };
+  });
+
+  pushUpdate(userId, { type: 'stoploss-batch-updated', stops: stopsPayload, targetPercent: L });
+  log.info(`🔧 Applied portfolio stops for ${userId}: target ${(L*100).toFixed(2)}% (AllowedLoss $${AllowedLoss.toFixed(2)})`);
 }
 
 // ====== Fifteen-minute drop checker ======
@@ -442,17 +552,27 @@ pollFinnhubEvents().catch(err => log.error('initial poll error', err.message));
 // ====== HTTP Routes ======
 app.get('/', (req, res) => res.send('✅ RiskWise AI Server Online (Events + Push)'));
 
+// Update portfolio (accepts optional targetPortfolioLossPercent and totalInvestment)
 app.post('/update-portfolio', (req, res) => {
-  const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment } = req.body;
-  if (!userId || !stocks) return res.status(400).json({ error: 'חסרים נתונים' });
+  const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment, targetPortfolioLossPercent } = req.body;
+  if (!userId || !stocks) return res.status(400).json({ error: 'חסרים נתונים: userId או stocks' });
 
   // sanitize/normalize stocks object shape expected by server:
-  // stocks = { "AAPL": { sector: 'Technology', ... }, "TSLA": {...} }
-  userPortfolios[userId] = { stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment };
+  // stocks = { "AAPL": { sector: 'Technology', shares?, positionValue?, entryPrice? }, "TSLA": {...} }
+  userPortfolios[userId] = { stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment, targetPortfolioLossPercent };
   log.info(`🔁 Portfolio updated for ${userId}:`, Object.keys(stocks || {}));
 
   // subscribe to live tickers (respecting limit)
   Object.keys(stocks || {}).forEach(symbol => subscribeToLiveTicker(symbol));
+
+  // if user provided a target portfolio loss percent, compute and apply stops now
+  if (targetPortfolioLossPercent && Number(targetPortfolioLossPercent) > 0) {
+    try {
+      computeAndApplyPortfolioStops(userId, Number(targetPortfolioLossPercent));
+    } catch (e) {
+      log.error('Error computing portfolio stops on update-portfolio', e.message);
+    }
+  }
 
   res.json({ message: 'Portfolio updated' });
 });
