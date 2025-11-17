@@ -307,15 +307,17 @@ async function checkAndUpdatePrices() {
 
     for (const symbol in portfolio.stocks) {
       try {
-        const price = portfolio.alpacaKeys ? await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret) : await getFinnhubPrice(symbol);
+        // שליפת מחיר עדכני
+        const price = portfolio.alpacaKeys
+          ? await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret)
+          : await getFinnhubPrice(symbol);
 
-        // save per-user price cache (old code used this)
+        // אחסון היסטוריית מחירים
+        const lastPrice = userPrices[userId][symbol]?.price;
         userPrices[userId][symbol] = { price, time: Date.now() };
-
-        // update portfolio object
         portfolio.stocks[symbol].lastPrice = price;
 
-        // SSE (both formats)
+        // SSE (תמיד נשלח עדכון מחיר)
         pushUpdate(userId, {
           stockTicker: symbol,
           price,
@@ -324,17 +326,22 @@ async function checkAndUpdatePrices() {
         });
         pushUpdate(userId, { type: 'price', symbol, price });
 
-        // 15min drop
+        // בדיקה לירידה חריגה 15 דקות
         await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
 
-        // risk calculation
-        const res = await calculateFullRisk(userId, symbol, price, portfolio);
+        // חישוב סיכון רק אם שינוי משמעותי או אין מידע קודם
+        const changePercent = lastPrice ? Math.abs((price - lastPrice) / lastPrice) * 100 : Infinity;
+        if (changePercent >= 1) { // שינוי ≥1%
+          const res = await calculateFullRisk(userId, symbol, price, portfolio);
+          if (res) await updateStopLossAndNotify(userId, symbol, portfolio, price, res.overallRiskScore);
+        }
+
       } catch (err) {
         log.error(`❌ שגיאה בעדכון ${symbol} (${userId}): ${err.message}`);
       }
     }
 
-    // after all symbols — recalc portfolio-level stoplosses (important to enforce overall maxLossPercent)
+    // בסיום כל המניות — עדכון סטופלוס רמת תיק
     try { await recalcPortfolioStopLosses(userId); } catch (e) { log.error('recalcPortfolioStopLosses error', e.message); }
   }
 }
