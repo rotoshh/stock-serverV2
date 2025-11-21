@@ -1,4 +1,4 @@
-// index.js — RiskWise AI Server (merged: old real-time + new portfolio-level stoploss)
+// index.js — RiskWise AI Server (optimized risk calc)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -20,6 +20,13 @@ const FINNHUB_KEY = process.env.FINNHUB_API_KEY || '';
 
 if (!FINNHUB_KEY) log.warn('WARNING: FINNHUB_API_KEY not set — event polling and news will not work.');
 
+// CONFIG: tune these via env if needed
+const MIN_RISK_INTERVAL_MS = Number(process.env.MIN_RISK_INTERVAL_MS || 5 * 60 * 1000); // default: 5 minutes between risk calcs per symbol
+const EVENT_RISK_COOLDOWN_MS = Number(process.env.EVENT_RISK_COOLDOWN_MS || 60 * 1000); // min interval for event-driven calc per symbol
+const PORTFOLIO_RECALC_COOLDOWN_MS = Number(process.env.PORTFOLIO_RECALC_COOLDOWN_MS || 30 * 1000); // min interval between portfolio recalc
+const PRICE_CHANGE_RISK_THRESHOLD_PCT = Number(process.env.PRICE_CHANGE_RISK_THRESHOLD_PCT || 1); // percent change to trigger risk calc
+const LOG_THROTTLE_MS = Number(process.env.LOG_THROTTLE_MS || 60 * 1000); // throttle repetitive logs per symbol
+
 // CORS
 const allowedOrigins = [
   'https://preview--risk-wise-396ab87e.base44.app',
@@ -37,23 +44,18 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '2mb' }));
 
-// ====== CONFIG: throttles / cooldowns ======
-const MIN_PRICE_CHANGE_PERCENT_FOR_RISK = Number(process.env.MIN_PRICE_CHANGE_PERCENT_FOR_RISK || 1); // %
-const RISK_CALC_COOLDOWN_MS = Number(process.env.RISK_CALC_COOLDOWN_MS || 5 * 60 * 1000); // default 5 minutes
-const STOPLOSS_NOTIFY_COOLDOWN_MS = Number(process.env.STOPLOSS_NOTIFY_COOLDOWN_MS || 15 * 60 * 1000); // avoid spamming emails/push
-const RISK_CHANGE_NOTIFY_THRESHOLD = Number(process.env.RISK_CHANGE_NOTIFY_THRESHOLD || 0.5); // only notify if risk changed by >= this
-
 // ====== MEMORY DB ======
 const userPortfolios = {};      // userId -> { stocks: { SYMBOL: { shares, entryPrice, ... } }, alpacaKeys, userEmail, totalInvestment, maxLossPercent }
-const userPrices = {};          // userId -> { SYMBOL: { price, time } }   (from old working code)
+const userPrices = {};          // userId -> { SYMBOL: { price, time } }
 const priceHistory15Min = {};   // userId -> { SYMBOL: { price, time } }
 const sseClients = {};          // userId -> [res,...]
 const userPushSubs = {};        // userId -> pushSubscription
 const seenFinnhubEvents = {};   // ticker -> { eventId: timestamp }
 
-// caching + in-flight dedupe for risk calculations
-const riskCache = {}; // riskCache[userId] = { [symbol]: { analysis, ts } }
-const inFlightRisk = {}; // inFlightRisk[`${userId}:${symbol}`] = Promise
+// added helpers state
+// per-symbol last portfolio risk calc timestamps are stored on portfolio.stocks[symbol].lastRiskAt
+// per-user last portfolio recalc timestamp
+const userLastPortfolioRecalcAt = {}; // userId -> timestamp
 
 // ====== Finnhub WS with safe reconnect/backoff & subscribe limit ======
 let finnhubSocket = null;
@@ -92,20 +94,20 @@ function connectFinnhubStream() {
               const portfolio = userPortfolios[userId];
               if (!portfolio || !portfolio.stocks) continue;
               if (portfolio.stocks[symbol]) {
-                // save per-user price cache (old code used userPrices)
+                // save per-user price cache
                 if (!userPrices[userId]) userPrices[userId] = {};
                 userPrices[userId][symbol] = { price, time: Date.now() };
 
                 // also update portfolio lastPrice
                 portfolio.stocks[symbol].lastPrice = price;
 
-                // SSE in two formats for compatibility:
+                // SSE price only (no automatic risk calc here)
                 try {
                   pushUpdate(userId, {
                     stockTicker: symbol,
                     price,
                     stopLoss: portfolio.stocks[symbol].stopLoss || null,
-                    risk: portfolio.stocks[symbol].overallRisk || portfolio.stocks[symbol].risk || null
+                    risk: portfolio.stocks[symbol].overallRisk ?? portfolio.stocks[symbol].risk ?? null
                   });
                 } catch (e) { /* ignore */ }
 
@@ -156,11 +158,33 @@ function pushUpdate(userId, data) {
   sseClients[userId].forEach(res => {
     try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (e) {}
   });
-  // keep logs concise: only log critical messages
-  if (data.type === 'risk-update' || data.type === 'stoploss-updated' || data.type === '15min-drop' || data.type === 'finnhub-event') {
-    log.info(`📡 נשלח עדכון SSE ל-${userId}:`, data);
+  // light-weight log for debugging — throttle repetitive identical messages
+  tryThrottleLog(userId, data);
+}
+
+function tryThrottleLog(userId, data) {
+  // simple throttled logging: only log detailed payloads at most once per LOG_THROTTLE_MS per user
+  const now = Date.now();
+  userLastLog = userLastLogMap[userId] || { ts: 0, last: null };
+  if (!userLastLogMap[userId]) userLastLogMap[userId] = userLastLog;
+  // we log only the type and symbol (if present) to avoid huge noise
+  if (!userLastLog.ts || (now - userLastLog.ts) > LOG_THROTTLE_MS) {
+    userLastLog.ts = now;
+    userLastLog.last = data;
+    log.info(`📡 נשלח עדכון SSE ל-${userId}:`, summarizeForLog(data));
   }
 }
+
+function summarizeForLog(data) {
+  if (!data) return data;
+  if (data.type === 'price') return { type: data.type, symbol: data.symbol, price: data.price };
+  if (data.stockTicker) return { stockTicker: data.stockTicker, price: data.price, stopLoss: data.stopLoss, risk: data.risk };
+  if (data.type === 'risk-update') return { type: data.type, symbol: data.symbol, risk: data.risk };
+  if (data.type === 'finnhub-event') return { type: data.type, symbol: data.symbol, headline: data.event?.headline?.slice(0,80) };
+  return data;
+}
+
+const userLastLogMap = {};
 
 // keep SSE alive
 setInterval(() => {
@@ -171,10 +195,17 @@ setInterval(() => {
   }
 }, 30_000);
 
-// ====== portfolio-level stop-loss calculation (as you already had) ======
-async function recalcPortfolioStopLosses(userId) {
+// ====== portfolio-level stop-loss calculation (as before) ======
+async function recalcPortfolioStopLosses(userId, { force = false } = {}) {
   const portfolio = userPortfolios[userId];
   if (!portfolio || !portfolio.stocks) return;
+
+  const now = Date.now();
+  const lastRecalc = userLastPortfolioRecalcAt[userId] || 0;
+  if (!force && (now - lastRecalc) < PORTFOLIO_RECALC_COOLDOWN_MS) {
+    return; // too soon to recalc again
+  }
+  userLastPortfolioRecalcAt[userId] = now;
 
   const symbols = Object.keys(portfolio.stocks);
   if (symbols.length === 0) return;
@@ -239,91 +270,63 @@ async function recalcPortfolioStopLosses(userId) {
       portfolio.stocks[symbol].stopLoss = newStop;
       pushUpdate(userId, { type: 'stoploss-updated', symbol, newStop, allocatedLoss: updates[symbol].allocatedLoss, weight: updates[symbol].weight });
 
-      // notify with cooldown to avoid spam
-      const lastNotified = portfolio.stocks[symbol].lastStopLossNotified || 0;
-      const now = Date.now();
-      if (now - lastNotified > STOPLOSS_NOTIFY_COOLDOWN_MS) {
-        portfolio.stocks[symbol].lastStopLossNotified = now;
+      if (userPushSubs[userId]) {
+        try {
+          await sendPushNotification(userPushSubs[userId], {
+            title: `עדכון סטופ לוס – ${symbol}`,
+            body: `סטופ לוס חדש נקבע על $${newStop} (מחשוב תחשיבי)`,
+            icon: '/icons/stoploss.png'
+          });
+          log.info(`📲 נשלחה התראת Push עדכון סטופ לוס ל-${userId} עבור ${symbol}`);
+        } catch (pushErr) { log.error('Push error sending stoploss update', pushErr.message); }
+      }
 
-        if (userPushSubs[userId]) {
-          try {
-            await sendPushNotification(userPushSubs[userId], {
-              title: `עדכון סטופ לוס – ${symbol}`,
-              body: `סטופ לוס חדש נקבע על $${newStop} (מחשוב תחשיבי)`,
-              icon: '/icons/stoploss.png'
-            });
-            log.info(`📲 נשלחה התראת Push עדכון סטופ לוס ל-${userId} עבור ${symbol}`);
-          } catch (pushErr) { log.error('Push error sending stoploss update', pushErr.message); }
-        }
-
-        if (portfolio.userEmail) {
-          try { await sendEmail({ to: portfolio.userEmail, subject: `עדכון סטופ לוס - ${symbol}`, html: `<p>סטופ לוס חדש ל-${symbol}: <b>$${newStop}</b></p><p>משקל סיכון יחסי: ${Math.round(updates[symbol].weight * 100)}%</p>` }); log.info(`📧 נשלח מייל עדכון סטופ לוס עבור ${symbol} (${userId})`); } catch (mailErr) { log.error('Mail error on stoploss update', mailErr.message); }
+      if (portfolio.userEmail) {
+        try { await sendEmail({ to: portfolio.userEmail, subject: `עדכון סטופ לוס - ${symbol}`, html: `<p>סטופ לוס חדש ל-${symbol}: <b>$${newStop}</b></p><p>משקל סיכון יחסי: ${Math.round(updates[symbol].weight * 100)}%</p>` }); log.info(`📧 נשלח מייל עדכון סטופ לוס עבור ${symbol} (${userId})`); } catch (mailErr) { log.error('Mail error on stoploss update', mailErr.message); }
       }
     }
   }
 }
 
 // ====== Risk wrapper (uses analyzeStockRisk) ======
-async function calculateFullRisk(userId, symbol, currentPrice, portfolio, opts = {}) {
-  // opts: { force: boolean }
-  const force = Boolean(opts.force);
-  if (!userId || !symbol) return null;
+// Add "force" and "reason" so callers can decide when to bypass cooldowns.
+async function calculateFullRisk(userId, symbol, currentPrice, portfolio, { force = false, reason = '' } = {}) {
+  try {
+    if (!portfolio || !portfolio.stocks || !portfolio.stocks[symbol]) return null;
 
-  if (!riskCache[userId]) riskCache[userId] = {};
+    const now = Date.now();
+    const s = portfolio.stocks[symbol];
+    s.lastRiskAt = s.lastRiskAt || 0;
 
-  const cacheEntry = riskCache[userId][symbol];
-  const now = Date.now();
-  if (!force && cacheEntry && (now - cacheEntry.ts) < RISK_CALC_COOLDOWN_MS) {
-    // return cached analysis if within cooldown
-    return { overallRiskScore: cacheEntry.analysis?.overallRiskScore ?? cacheEntry.analysis?.riskScore ?? null, analysis: cacheEntry.analysis, cached: true };
-  }
-
-  const key = `${userId}:${symbol}`;
-  if (inFlightRisk[key]) {
-    try { const res = await inFlightRisk[key]; return res; } catch (e) { /* fall through to compute */ }
-  }
-
-  // create a promise and store in inFlightRisk to dedupe concurrent requests
-  const promise = (async () => {
-    try {
-      const analysis = await analyzeStockRisk(symbol, currentPrice);
-      const overallRiskScore = analysis?.overallRiskScore ?? analysis?.riskScore ?? null;
-
-      // store to portfolio and cache
-      if (portfolio && portfolio.stocks && portfolio.stocks[symbol]) {
-        const prevRisk = portfolio.stocks[symbol].overallRisk ?? portfolio.stocks[symbol].risk ?? null;
-        portfolio.stocks[symbol].overallRisk = overallRiskScore;
-        portfolio.stocks[symbol].beta = analysis.beta ?? portfolio.stocks[symbol].beta;
-        portfolio.stocks[symbol].volatility = analysis.volatility ?? portfolio.stocks[symbol].volatility;
-        portfolio.stocks[symbol].sentiment = analysis.sentiment ?? portfolio.stocks[symbol].sentiment;
-        portfolio.stocks[symbol].earningsImpact = analysis.earningsImpact ?? portfolio.stocks[symbol].earningsImpact;
-        portfolio.stocks[symbol].analysis = analysis;
-
-        // update cache
-        riskCache[userId][symbol] = { analysis, ts: Date.now() };
-
-        // only push risk-update if changed by threshold or if forced
-        const changed = prevRisk === null || Math.abs((overallRiskScore || 0) - (prevRisk || 0)) >= RISK_CHANGE_NOTIFY_THRESHOLD;
-        if (force || changed) {
-          pushUpdate(userId, { type: 'risk-update', symbol, risk: overallRiskScore, details: analysis });
-          log.info(`📊 ${symbol} סיכון כולל: ${overallRiskScore}/10 | β=${analysis.beta} σ=${analysis.volatility}`);
-        } else {
-          // keep a compact debug log for repeated cached calls
-          log.debug && log.debug(`(cached/unchanged) ${symbol} risk ${overallRiskScore}`);
-        }
-      }
-
-      return { overallRiskScore, analysis };
-    } catch (e) {
-      log.error(`❌ שגיאה בחישוב סיכון עבור ${symbol}: ${e.message}`);
-      throw e;
-    } finally {
-      delete inFlightRisk[key];
+    if (!force && (now - s.lastRiskAt) < MIN_RISK_INTERVAL_MS) {
+      // skip recalculation to avoid spam
+      log.info && log.info(`⏱️ Skipping risk calc for ${symbol} (cooldown). reason=${reason}`);
+      return null;
     }
-  })();
 
-  inFlightRisk[key] = promise;
-  return promise;
+    // mark when we started (prevents bursts from other callers)
+    s.lastRiskAt = now;
+
+    const analysis = await analyzeStockRisk(symbol, currentPrice);
+    const overallRiskScore = analysis?.overallRiskScore ?? analysis?.riskScore ?? null;
+
+    portfolio.stocks[symbol].overallRisk = overallRiskScore;
+    portfolio.stocks[symbol].beta = analysis.beta ?? portfolio.stocks[symbol].beta;
+    portfolio.stocks[symbol].volatility = analysis.volatility ?? portfolio.stocks[symbol].volatility;
+    portfolio.stocks[symbol].sentiment = analysis.sentiment ?? portfolio.stocks[symbol].sentiment;
+    portfolio.stocks[symbol].earningsImpact = analysis.earningsImpact ?? portfolio.stocks[symbol].earningsImpact;
+    portfolio.stocks[symbol].analysis = analysis;
+
+    // throttle repetitive risk logs per symbol
+    const lastLogged = portfolio.stocks[symbol].lastLoggedRiskAt || 0;
+    if ((Date.now() - lastLogged) > LOG_THROTTLE_MS) {
+      portfolio.stocks[symbol].lastLoggedRiskAt = Date.now();
+      log.info(`📊 ${symbol} סיכון כולל: ${overallRiskScore}/10 | β=${analysis.beta} σ=${analysis.volatility}`);
+    }
+
+    pushUpdate(userId, { type: 'risk-update', symbol, risk: overallRiskScore, details: analysis });
+    return { overallRiskScore, analysis };
+  } catch (e) { log.error(`❌ שגיאה בחישוב סיכון עבור ${symbol}: ${e.message}`); return null; }
 }
 
 // deprecated fallback (kept for compatibility)
@@ -348,8 +351,8 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
     const change = ((currentPrice - history.price) / history.price) * 100;
     if (change <= -5) {
       log.warn(`📉 ירידה ${change.toFixed(2)}% ב-15 דק' עבור ${symbol} (${userId})`);
-      // force risk calc on big drop
-      const res = await calculateFullRisk(userId, symbol, currentPrice, portfolio, { force: true });
+      // treat as important trigger => force a risk calc (but still respect MIN_RISK_INTERVAL_MS to avoid loops)
+      const res = await calculateFullRisk(userId, symbol, currentPrice, portfolio, { force: true, reason: '15min-drop' });
       if (res) await updateStopLossAndNotify(userId, symbol, portfolio, currentPrice, res.overallRiskScore);
       if (userPushSubs[userId]) {
         try { await sendPushNotification(userPushSubs[userId], { title: `📉 ירידה חדה: ${symbol}`, body: `${symbol} ירדה ${change.toFixed(2)}% ב-15 הדקות האחרונות.`, icon: '/icons/drop.png' }); log.info(`📲 נשלחה התראת Push ירידה חדה ל-${userId}`); } catch (e) { log.error('Push error pada 15min drop', e.message); }
@@ -360,7 +363,7 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
   priceHistory15Min[userId][symbol] = { price: currentPrice, time: now };
 }
 
-// ====== Price update loop (integrates old behavior: userPrices cache + immediate risk calc + recalc portfolio)
+// ====== Price update loop (optimized: risk only on triggers + cooldowns) ======
 async function checkAndUpdatePrices() {
   for (const userId in userPortfolios) {
     const portfolio = userPortfolios[userId];
@@ -369,34 +372,34 @@ async function checkAndUpdatePrices() {
 
     for (const symbol in portfolio.stocks) {
       try {
-        // שליפת מחיר עדכני
+        // fetch current price
         const price = portfolio.alpacaKeys
           ? await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret)
           : await getFinnhubPrice(symbol);
 
-        // אחסון היסטוריית מחירים
+        // save previous price
         const lastPrice = userPrices[userId][symbol]?.price;
         userPrices[userId][symbol] = { price, time: Date.now() };
         portfolio.stocks[symbol].lastPrice = price;
 
-        // SSE (תמיד נשלח עדכון מחיר)
+        // always publish price update (lightweight)
         pushUpdate(userId, {
           stockTicker: symbol,
           price,
           stopLoss: portfolio.stocks[symbol].stopLoss || null,
-          risk: portfolio.stocks[symbol].overallRisk || portfolio.stocks[symbol].risk || null
+          risk: portfolio.stocks[symbol].overallRisk ?? portfolio.stocks[symbol].risk ?? null
         });
         pushUpdate(userId, { type: 'price', symbol, price });
 
-        // בדיקה לירידה חריגה 15 דקות
+        // 15min drop check
         await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
 
-        // חישוב סיכון רק אם שינוי משמעותי או אין מידע קודם
+        // calculate percent change from last cached price and decide whether to compute risk
         const changePercent = lastPrice ? Math.abs((price - lastPrice) / lastPrice) * 100 : Infinity;
-        if (changePercent >= MIN_PRICE_CHANGE_PERCENT_FOR_RISK) {
-          // call; calculateFullRisk will use cache/dedupe internally
-          const res = await calculateFullRisk(userId, symbol, price, portfolio, { force: false });
-          if (res && !res.cached) await updateStopLossAndNotify(userId, symbol, portfolio, price, res.overallRiskScore);
+        if (changePercent >= PRICE_CHANGE_RISK_THRESHOLD_PCT) {
+          // price-movement triggered calc (not forced) — will respect MIN_RISK_INTERVAL_MS
+          const res = await calculateFullRisk(userId, symbol, price, portfolio, { force: false, reason: 'price-move' });
+          if (res) await updateStopLossAndNotify(userId, symbol, portfolio, price, res.overallRiskScore);
         }
 
       } catch (err) {
@@ -404,12 +407,12 @@ async function checkAndUpdatePrices() {
       }
     }
 
-    // בסיום כל המניות — עדכון סטופלוס רמת תיק
-    try { await recalcPortfolioStopLosses(userId); } catch (e) { log.error('recalcPortfolioStopLosses error', e.message); }
+    // recalc portfolio-level stoplosses — with cooldown to avoid churn
+    try { await recalcPortfolioStopLosses(userId, { force: false }); } catch (e) { log.error('recalcPortfolioStopLosses error', e.message); }
   }
 }
 
-// ====== Finnhub event polling (news + earnings) (kept as before, but safer)
+// ====== Finnhub event polling (news + earnings) ======
 async function fetchCompanyNews(symbol, fromISO, toISO) {
   if (!FINNHUB_KEY) return [];
   try {
@@ -437,22 +440,23 @@ async function handleEventForTicker(symbol, event) {
     const p = userPortfolios[userId];
     if (!p.stocks || !p.stocks[symbol]) continue;
     try {
-      const price = p.alpacaKeys ? await getAlpacaPrice(symbol, p.alpacaKeys.key, p.alpacaKeys.secret) : await getFinnhubPrice(symbol);
+      // event-driven risk calcs: limit to one per SYMBOL per EVENT_RISK_COOLDOWN_MS
+      const lastRisk = p.stocks[symbol].lastRiskAt || 0;
+      if ((now - lastRisk) < EVENT_RISK_COOLDOWN_MS) {
+        log.info(`⏱️ Skipping event-driven risk for ${symbol} (cooldown). headline=${event.headline?.slice(0,80)}`);
+        pushUpdate(userId, { type: 'finnhub-event', symbol, event, risk: p.stocks[symbol].overallRisk });
+        continue;
+      }
 
-      // Ask calculateFullRisk to decide (it will use cache and dedupe)
-      const res = await calculateFullRisk(userId, symbol, price, p, { force: false });
+      const price = p.alpacaKeys ? await getAlpacaPrice(symbol, p.alpacaKeys.key, p.alpacaKeys.secret) : await getFinnhubPrice(symbol);
+      const res = await calculateFullRisk(userId, symbol, price, p, { force: true, reason: 'finnhub-event' });
       if (res) {
-        // notify only if we actually recalculated (not purely cached) or if change large
-        if (!res.cached || (res.overallRiskScore && Math.abs(res.overallRiskScore - (p.stocks[symbol].overallRisk || 0)) >= RISK_CHANGE_NOTIFY_THRESHOLD)) {
-          if (userPushSubs[userId]) {
-            try { await sendPushNotification(userPushSubs[userId], { title: `חדשות ל־${symbol}`, body: `${event.headline || 'אירוע משמעותי'} — הסיכון עכשיו: ${res.overallRiskScore}/10`, icon: '/icons/news.png', data: { symbol, event } }); } catch (pushErr) { log.error('Push error on event notify', pushErr.message); }
-          }
-          if (p.userEmail) { try { await sendEmail({ to: p.userEmail, subject: `אירוע חשוב ב־${symbol}: ${event.headline || 'אירוע'}`, html: `<h3>אירוע ב־${symbol}</h3><p>${event.headline || event.summary || JSON.stringify(event)}</p><p>רמת סיכון עכשווית: ${res.overallRiskScore}/10</p>` }); } catch (mailErr) { log.error('Mail error on event notify', mailErr.message); } }
-          pushUpdate(userId, { type: 'finnhub-event', symbol, event, risk: res.overallRiskScore });
-        } else {
-          // skip noisy notifications if nothing meaningful changed
-          log.debug && log.debug(`Skipping event-notify for ${symbol} (no recent/cached)`);
+        // notify (push + mail) but keep notifications deduped by seenFinnhubEvents and handled cooldowns
+        if (userPushSubs[userId]) {
+          try { await sendPushNotification(userPushSubs[userId], { title: `חדשות ל־${symbol}`, body: `${event.headline || 'אירוע משמעותי'} — הסיכון עכשיו: ${res.overallRiskScore}/10`, icon: '/icons/news.png', data: { symbol, event } }); } catch (pushErr) { log.error('Push error on event notify', pushErr.message); }
         }
+        if (p.userEmail) { try { await sendEmail({ to: p.userEmail, subject: `אירוע חשוב ב־${symbol}: ${event.headline || 'אירוע'}`, html: `<h3>אירוע ב־${symbol}</h3><p>${event.headline || event.summary || JSON.stringify(event)}</p><p>רמת סיכון עכשווית: ${res.overallRiskScore}/10</p>` }); } catch (mailErr) { log.error('Mail error on event notify', mailErr.message); } }
+        pushUpdate(userId, { type: 'finnhub-event', symbol, event, risk: res.overallRiskScore });
       }
     } catch (err) { log.error('handleEventForTicker error', err.message); }
   }
@@ -501,8 +505,8 @@ app.post('/update-portfolio', (req, res) => {
   // keep an initial per-user price cache object
   if (!userPrices[userId]) userPrices[userId] = {};
 
-  // initial recalc of portfolio stoplosses (async)
-  recalcPortfolioStopLosses(userId).catch(err => log.error('initial recalcPortfolioStopLosses', err.message));
+  // initial recalc of portfolio stoplosses (async) - force this one time
+  recalcPortfolioStopLosses(userId, { force: true }).catch(err => log.error('initial recalcPortfolioStopLosses', err.message));
 
   res.json({ message: 'Portfolio updated' });
 });
@@ -557,13 +561,14 @@ app.post('/risk/bulk', async (req, res) => {
 app.post('/webhook/event', async (req, res) => {
   const { ticker } = req.body;
   if (!ticker) return res.status(400).json({ error: 'ticker required' });
+  // clear seen events for this ticker so webhook can force reprocessing if needed
   seenFinnhubEvents[ticker] = {};
   for (const userId in userPortfolios) {
     const p = userPortfolios[userId];
     if (p.stocks && p.stocks[ticker]) {
       try {
         const price = p.alpacaKeys ? await getAlpacaPrice(ticker, p.alpacaKeys.key, p.alpacaKeys.secret) : await getFinnhubPrice(ticker);
-        const resCalc = await calculateFullRisk(userId, ticker, price, p, { force: true });
+        const resCalc = await calculateFullRisk(userId, ticker, price, p, { force: true, reason: 'webhook' });
         if (resCalc) { await updateStopLossAndNotify(userId, ticker, p, price, resCalc.overallRiskScore); pushUpdate(userId, { type: 'webhook-recalc', ticker, price, risk: resCalc.overallRiskScore }); }
       } catch (err) { log.error('Webhook recalculation error for', ticker, err.message); }
     }
