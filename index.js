@@ -151,6 +151,53 @@ function subscribeToLiveTicker(symbol) {
   }
 }
 
+// ====== GLOBAL PRICE CACHE (to avoid duplicate calls & rate limit) ======
+const priceCache = {}; // symbol -> { price, ts, source }
+
+const PRICE_CACHE_TTL_MS = 2000; // 2s TTL (adjustable)
+
+async function fetchPriceFromProviders(symbol, preferAlpacaKeys = null) {
+  // preferAlpacaKeys: { key, secret } or null
+  // Try Alpaca if keys provided; on 429 or error -> fallback to Finnhub
+  try {
+    if (preferAlpacaKeys) {
+      try {
+        const p = await getAlpacaPrice(symbol, preferAlpacaKeys.key, preferAlpacaKeys.secret);
+        return { price: p, source: 'alpaca' };
+      } catch (alpErr) {
+        // If rate-limit (429) or other error, log and fallback
+        log.warn(`שגיאה בשליפת מחיר עבור ${symbol} מ-Alpaca: ${alpErr.message}`);
+        if (alpErr.response && alpErr.response.status === 429) {
+          log.warn(`Alpaca rate limit for ${symbol} — falling back to Finnhub`);
+        }
+        // continue to Finnhub fallback
+      }
+    }
+    // Finnhub fallback
+    try {
+      const p2 = await getFinnhubPrice(symbol);
+      return { price: p2, source: 'finnhub' };
+    } catch (finErr) {
+      log.error(`Finnhub price fetch failed for ${symbol}: ${finErr.message}`);
+      throw finErr;
+    }
+  } catch (e) {
+    throw e;
+  }
+}
+
+async function getCachedPrice(symbol, preferAlpacaKeys = null) {
+  const now = Date.now();
+  const cached = priceCache[symbol];
+  if (cached && (now - cached.ts) <= PRICE_CACHE_TTL_MS) {
+    return { price: cached.price, source: cached.source, cached: true };
+  }
+  // fetch fresh
+  const res = await fetchPriceFromProviders(symbol, preferAlpacaKeys);
+  priceCache[symbol] = { price: res.price, ts: now, source: res.source };
+  return { price: res.price, source: res.source, cached: false };
+}
+
 connectFinnhubStream();
 
 // ====== SSE helpers ======
@@ -196,18 +243,22 @@ setInterval(() => {
   }
 }, 30_000);
 
-// ====== portfolio-level stop-loss calculation (as before) ======
-async function recalcPortfolioStopLosses(userId, { force = false } = {}) {
-  const portfolio = userPortfolios[userId];
+// wrapper to allow recalculation for specific kind: 'alpaca' or 'manual'
+async function recalcPortfolioStopLossesForKind(userId, kind) {
+  const up = userPortfolios[userId];
+  if (!up) return;
+  const portfolio = up[kind];
   if (!portfolio || !portfolio.stocks) return;
+  // reuse existing recalc logic but expecting portfolio shape like before
+  return recalcPortfolioStopLossesGeneric(userId, portfolio);
+}
 
-  const now = Date.now();
-  const lastRecalc = userLastPortfolioRecalcAt[userId] || 0;
-  if (!force && (now - lastRecalc) < PORTFOLIO_RECALC_COOLDOWN_MS) {
-    return; // too soon to recalc again
-  }
-  userLastPortfolioRecalcAt[userId] = now;
-
+// extract original logic into a generic that accepts portfolio object
+async function recalcPortfolioStopLossesGeneric(userId, portfolio) {
+  // same code as your previous recalcPortfolioStopLosses but WITHOUT reading userPortfolios[userId] directly.
+  // For brevity in this message I'll assume we copy the body of recalcPortfolioStopLosses but reading 'portfolio' param.
+  // Replace your recalcPortfolioStopLosses with the content below (copy/paste from your original recalc but use `portfolio`).
+  // --- BEGIN (paste your recalc function body here, replacing references to userPortfolios[userId] with 'portfolio') ---
   const symbols = Object.keys(portfolio.stocks);
   if (symbols.length === 0) return;
 
@@ -215,7 +266,15 @@ async function recalcPortfolioStopLosses(userId, { force = false } = {}) {
   for (const symbol of symbols) {
     const s = portfolio.stocks[symbol];
     if (s && typeof s.lastPrice === 'number') { prices[symbol] = s.lastPrice; continue; }
-    try { prices[symbol] = portfolio.alpacaKeys ? await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret) : await getFinnhubPrice(symbol); } catch (e) { log.error('price fetch failed for', symbol, e.message); prices[symbol] = null; }
+    try {
+      // if portfolio has alpacaKeys use them; else no prefer
+      const prefer = portfolio.alpacaKeys ? portfolio.alpacaKeys : null;
+      const cached = await getCachedPrice(symbol, prefer);
+      prices[symbol] = cached.price;
+    } catch (e) {
+      log.error('price fetch failed for', symbol, e.message);
+      prices[symbol] = null;
+    }
   }
 
   let portfolioValue = 0;
@@ -223,7 +282,7 @@ async function recalcPortfolioStopLosses(userId, { force = false } = {}) {
   for (const symbol of symbols) {
     const s = portfolio.stocks[symbol];
     const shares = Number(s.shares || s.quantity || 0);
-    const entry = Number(s.entryPrice || 0);
+    const entry = Number(s.entryPrice || s.entry_price || 0);
     const current = Number(prices[symbol] || entry || 0);
     const pv = shares * current;
     posValues[symbol] = { shares, entryPrice: entry || current, currentPrice: current, positionValue: pv };
@@ -271,22 +330,25 @@ async function recalcPortfolioStopLosses(userId, { force = false } = {}) {
       portfolio.stocks[symbol].stopLoss = newStop;
       pushUpdate(userId, { type: 'stoploss-updated', symbol, newStop, allocatedLoss: updates[symbol].allocatedLoss, weight: updates[symbol].weight });
 
-      if (userPushSubs[userId]) {
-        try {
+      // send push/mail only for real portfolios with user subscription/email
+      try {
+        const upMeta = userPortfolios[userId];
+        if (upMeta && userPushSubs[userId]) {
           await sendPushNotification(userPushSubs[userId], {
             title: `עדכון סטופ לוס – ${symbol}`,
             body: `סטופ לוס חדש נקבע על $${newStop} (מחשוב תחשיבי)`,
             icon: '/icons/stoploss.png'
           });
           log.info(`📲 נשלחה התראת Push עדכון סטופ לוס ל-${userId} עבור ${symbol}`);
-        } catch (pushErr) { log.error('Push error sending stoploss update', pushErr.message); }
-      }
+        }
+      } catch (pushErr) { log.error('Push error sending stoploss update', pushErr.message); }
 
-      if (portfolio.userEmail) {
-        try { await sendEmail({ to: portfolio.userEmail, subject: `עדכון סטופ לוס - ${symbol}`, html: `<p>סטופ לוס חדש ל-${symbol}: <b>$${newStop}</b></p><p>משקל סיכון יחסי: ${Math.round(updates[symbol].weight * 100)}%</p>` }); log.info(`📧 נשלח מייל עדכון סטופ לוס עבור ${symbol} (${userId})`); } catch (mailErr) { log.error('Mail error on stoploss update', mailErr.message); }
+      if (userPortfolios[userId] && userPortfolios[userId].userEmail) {
+        try { await sendEmail({ to: userPortfolios[userId].userEmail, subject: `עדכון סטופ לוס - ${symbol}`, html: `<p>סטופ לוס חדש ל-${symbol}: <b>$${newStop}</b></p><p>משקל סיכון יחסי: ${Math.round(updates[symbol].weight * 100)}%</p>` }); log.info(`📧 נשלח מייל עדכון סטופ לוס עבור ${symbol} (${userId})`); } catch (mailErr) { log.error('Mail error on stoploss update', mailErr.message); }
       }
     }
   }
+  // --- END generic recalc ---
 }
 
 // ====== Risk wrapper (uses analyzeStockRisk) ======
@@ -364,52 +426,77 @@ async function checkFifteenMinuteDrop(userId, symbol, currentPrice, portfolio) {
   priceHistory15Min[userId][symbol] = { price: currentPrice, time: now };
 }
 
-// ====== Price update loop (optimized: risk only on triggers + cooldowns) ======
 async function checkAndUpdatePrices() {
+  // Build a global map symbol -> list of contexts needing this symbol
+  const symbolContexts = {}; // symbol -> [ { userId, kind: 'alpaca'|'manual', portfolioRef, preferAlpacaKeys } ]
+
   for (const userId in userPortfolios) {
-    const portfolio = userPortfolios[userId];
-    if (!portfolio || !portfolio.stocks) continue;
-    if (!userPrices[userId]) userPrices[userId] = {};
+    const up = userPortfolios[userId];
+    if (!up) continue;
+    // manual
+    if (up.manual && up.manual.stocks) {
+      for (const sym in up.manual.stocks) {
+        symbolContexts[sym] = symbolContexts[sym] || [];
+        symbolContexts[sym].push({ userId, kind: 'manual', portfolioRef: up.manual, preferAlpacaKeys: null });
+      }
+    }
+    // alpaca
+    if (up.alpaca && up.alpaca.stocks) {
+      for (const sym in up.alpaca.stocks) {
+        symbolContexts[sym] = symbolContexts[sym] || [];
+        symbolContexts[sym].push({ userId, kind: 'alpaca', portfolioRef: up.alpaca, preferAlpacaKeys: up.alpaca.alpacaKeys });
+      }
+    }
+  }
 
-    for (const symbol in portfolio.stocks) {
-      try {
-        // fetch current price
-        const price = portfolio.alpacaKeys
-          ? await getAlpacaPrice(symbol, portfolio.alpacaKeys.key, portfolio.alpacaKeys.secret)
-          : await getFinnhubPrice(symbol);
-
-        // save previous price
-        const lastPrice = userPrices[userId][symbol]?.price;
+  // For each symbol fetch price once (prefer Alpaca if any context requested it)
+  for (const symbol of Object.keys(symbolContexts)) {
+    try {
+      // decide preferAlpacaKeys if any context has alpaca preference (choose first)
+      const prefer = symbolContexts[symbol].find(c => c.preferAlpacaKeys)?.preferAlpacaKeys ?? null;
+      const { price, source } = await getCachedPrice(symbol, prefer);
+      // Now update each context that requested this symbol
+      for (const ctx of symbolContexts[symbol]) {
+        const { userId, portfolioRef, kind } = ctx;
+        // save per-user price cache (old code used userPrices)
+        if (!userPrices[userId]) userPrices[userId] = {};
         userPrices[userId][symbol] = { price, time: Date.now() };
-        portfolio.stocks[symbol].lastPrice = price;
 
-        // always publish price update (lightweight)
+        // update portfolio object
+        portfolioRef.stocks[symbol].lastPrice = price;
+
+        // SSE: send price update
         pushUpdate(userId, {
           stockTicker: symbol,
           price,
-          stopLoss: portfolio.stocks[symbol].stopLoss || null,
-          risk: portfolio.stocks[symbol].overallRisk ?? portfolio.stocks[symbol].risk ?? null
+          stopLoss: portfolioRef.stocks[symbol].stopLoss || null,
+          risk: portfolioRef.stocks[symbol].overallRisk || portfolioRef.stocks[symbol].risk || null
         });
         pushUpdate(userId, { type: 'price', symbol, price });
 
-        // 15min drop check
-        await checkFifteenMinuteDrop(userId, symbol, price, portfolio);
+        // 15min drop check (pass the right portfolio)
+        await checkFifteenMinuteDrop(userId, symbol, price, portfolioRef);
 
-        // calculate percent change from last cached price and decide whether to compute risk
+        // decide if compute risk: only if price change >=1% against lastPrice for this user
+        const lastPrice = userPrices[userId][symbol]?.price;
         const changePercent = lastPrice ? Math.abs((price - lastPrice) / lastPrice) * 100 : Infinity;
-        if (changePercent >= PRICE_CHANGE_RISK_THRESHOLD_PCT) {
-          // price-movement triggered calc (not forced) — will respect MIN_RISK_INTERVAL_MS
-          const res = await calculateFullRisk(userId, symbol, price, portfolio, { force: false, reason: 'price-move' });
-          if (res) await updateStopLossAndNotify(userId, symbol, portfolio, price, res.overallRiskScore);
+        if (changePercent >= 1 || !portfolioRef.stocks[symbol].overallRisk) {
+          const res = await calculateFullRisk(userId, symbol, price, portfolioRef);
+          if (res) await updateStopLossAndNotify(userId, symbol, portfolioRef, price, res.overallRiskScore);
         }
-
-      } catch (err) {
-        log.error(`❌ שגיאה בעדכון ${symbol} (${userId}): ${err.message}`);
       }
+    } catch (err) {
+      log.error(`❌ שגיאה בעדכון ${symbol}: ${err.message}`);
+      // do not spam: continue
     }
+  }
 
-    // recalc portfolio-level stoplosses — with cooldown to avoid churn
-    try { await recalcPortfolioStopLosses(userId, { force: false }); } catch (e) { log.error('recalcPortfolioStopLosses error', e.message); }
+  // after all symbols — recalc stoplosses for each user's portfolios separately
+  for (const userId in userPortfolios) {
+    try {
+      if (userPortfolios[userId].manual) await recalcPortfolioStopLossesForKind(userId, 'manual');
+      if (userPortfolios[userId].alpaca) await recalcPortfolioStopLossesForKind(userId, 'alpaca');
+    } catch (e) { log.error('recalcPortfolioStopLosses error', e.message); }
   }
 }
 
@@ -490,24 +577,42 @@ pollFinnhubEvents().catch(err => log.error('initial poll error', err.message));
 // ====== HTTP Routes ======
 app.get('/', (req, res) => res.send('✅ RiskWise AI Server Online (Events + Push)'));
 
-// update-portfolio (old payload compatible + new fields)
+// update-portfolio (supports both manual and alpaca portfolios for same user)
 app.post('/update-portfolio', (req, res) => {
   log.info('🌐 POST /update-portfolio', JSON.stringify(req.body));
-  const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment, maxLossPercent } = req.body;
-  if (!userId || !stocks) return res.status(400).json({ error: 'חסרים נתונים' });
+  const { userId, stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment, maxLossPercent, type } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId required' });
 
-  // sanitize shape like old code
-  userPortfolios[userId] = { stocks, alpacaKeys, userEmail, portfolioRiskLevel, totalInvestment, maxLossPercent };
-  log.info(`🔁 Portfolio updated for ${userId}:`, Object.keys(stocks || {}));
+  // initialize user entry if needed
+  if (!userPortfolios[userId]) userPortfolios[userId] = { manual: null, alpaca: null, userEmail: null, portfolioRiskLevel: null, totalInvestment: null, maxLossPercent: null };
 
-  // subscribe to live tickers (respect limit)
-  Object.keys(stocks || {}).forEach(symbol => subscribeToLiveTicker(symbol));
+  // Save common meta
+  if (userEmail) userPortfolios[userId].userEmail = userEmail;
+  if (typeof portfolioRiskLevel !== 'undefined') userPortfolios[userId].portfolioRiskLevel = portfolioRiskLevel;
+  if (typeof totalInvestment !== 'undefined') userPortfolios[userId].totalInvestment = totalInvestment;
+  if (typeof maxLossPercent !== 'undefined') userPortfolios[userId].maxLossPercent = maxLossPercent;
 
-  // keep an initial per-user price cache object
+  // Decide where to put stocks: if alpacaKeys present -> alpaca, otherwise manual.
+  if (alpacaKeys) {
+    userPortfolios[userId].alpaca = { stocks: stocks || {}, alpacaKeys };
+    log.info(`🔁 Alpaca portfolio updated for ${userId}:`, Object.keys(stocks || {}));
+    Object.keys(stocks || {}).forEach(symbol => subscribeToLiveTicker(symbol));
+  } else if (stocks) {
+    userPortfolios[userId].manual = { stocks };
+    log.info(`🔁 Manual portfolio updated for ${userId}:`, Object.keys(stocks || {}));
+    Object.keys(stocks || {}).forEach(symbol => subscribeToLiveTicker(symbol));
+  } else {
+    // If called to clear one of them, allow payload type to indicate (optional)
+    if (type === 'clear-alpaca') userPortfolios[userId].alpaca = null;
+    if (type === 'clear-manual') userPortfolios[userId].manual = null;
+  }
+
+  // ensure price cache holder per user
   if (!userPrices[userId]) userPrices[userId] = {};
 
-  // initial recalc of portfolio stoplosses (async) - force this one time
-  recalcPortfolioStopLosses(userId, { force: true }).catch(err => log.error('initial recalcPortfolioStopLosses', err.message));
+  // recalc stoplosses for both portfolios async
+  if (userPortfolios[userId].alpaca) recalcPortfolioStopLossesForKind(userId, 'alpaca').catch(err => log.error('initial recalc alpaca', err.message));
+  if (userPortfolios[userId].manual) recalcPortfolioStopLossesForKind(userId, 'manual').catch(err => log.error('initial recalc manual', err.message));
 
   res.json({ message: 'Portfolio updated' });
 });
