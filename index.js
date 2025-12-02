@@ -30,6 +30,7 @@ const LOG_THROTTLE_MS = Number(process.env.LOG_THROTTLE_MS || 60 * 1000); // thr
 // CORS
 const allowedOrigins = [
   'https://preview--risk-wise-396ab87e.base44.app',
+  'https://risk-wise-396ab87e.base44.app',
   'http://localhost:3000',
   'https://ta-01kbdmpk0e2bjyfzym639j663v-5173.wo-tal2sab99o2fihwqy0q42txk2.w.modal.host',
   'https://ta-01kbe7v5gepd5416xc60twxckd-5173.wo-p0hm3k156ybojezf1zjywwtio.w.modal.host',
