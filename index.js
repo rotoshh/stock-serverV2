@@ -32,7 +32,7 @@ const allowedOrigins = [
   'https://preview--risk-wise-396ab87e.base44.app',
   'http://localhost:3000',
   'https://ta-01kbdmpk0e2bjyfzym639j663v-5173.wo-tal2sab99o2fihwqy0q42txk2.w.modal.host',
-  'https://ta-01kbe334re2jwh46v0ck7y2gj6-5173.wo-fg8v2hmvq5sdzfghiamr6fed6.w.modal.host',
+  'https://ta-01kbe7v5gepd5416xc60twxckd-5173.wo-p0hm3k156ybojezf1zjywwtio.w.modal.host',
 ];
 app.use(cors({
   origin: (origin, cb) => {
